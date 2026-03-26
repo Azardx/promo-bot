@@ -115,6 +115,21 @@ async def cmd_aviso_admin(msg: types.Message):
 # -------------------------
 # PROCESSAMENTO DE PROMO/CUPOM
 # -------------------------
+
+async def processar_promo(titulo, link):
+    if not validar_link(link) or link in recent_links:
+        return
+
+    # O SEGREDO ESTÁ AQUI: Logar quando o Banco de Dados barrar
+    if await promo_exists(link):
+        logger.debug(f"⏭️ Ignorando repetida: {titulo}")
+        return
+
+    await add_promo(link)
+    recent_links.add(link)
+    
+    # ... (o resto da função continua igualzinho com a lógica de Cupom que fizemos) ...
+
 async def processar_promo(titulo, link):
     if not validar_link(link) or link in recent_links:
         return

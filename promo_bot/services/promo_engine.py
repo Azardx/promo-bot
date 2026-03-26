@@ -8,6 +8,7 @@ from scrapers.kabum import scrape as buscar_kabum
 from scrapers.promobit import scrap_promobit
 from scrapers.shopee import scrape as buscar_shopee
 from scrapers.terabyte import buscar_terabyte
+from scrapers.pelando import scrap_pelando
 
 from utils.fake_promo_detector import promo_falsa
 from utils.price_analyzer import analisar_preco
@@ -21,6 +22,7 @@ async def coletar_promos():
     tarefas = {
         "Kabum": buscar_kabum(),
         "Promobit": scrap_promobit(),
+        "Pelando": scrap_pelando(),
         "Shopee": buscar_shopee(),
         "Amazon": buscar_amazon(),
         "AliExpress": buscar_aliexpress(),
