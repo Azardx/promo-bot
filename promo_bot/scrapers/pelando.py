@@ -1,161 +1,218 @@
 """
-Scraper de promoções do Pelando.
+Scraper do Pelando via JSON-LD e meta tags da página principal.
 
-O Pelando é um agregador de promoções brasileiro, similar ao Pepper/Slickdeals.
-Coleta ofertas já validadas pela comunidade, com alto nível de relevância.
+O Pelando inclui dados estruturados no HTML via tags JSON-LD e
+meta tags og:. Este scraper extrai URLs do JSON-LD e dados
+básicos da página principal, evitando acessar páginas individuais
+que frequentemente retornam 403.
 """
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Optional
 
-from bs4 import BeautifulSoup
-
 from promo_bot.database.models import Product, Store
 from promo_bot.scrapers.base import BaseScraper
+from promo_bot.utils.cache import TTLCache
+from promo_bot.utils.http_client import HttpClient
 
 
 class PelandoScraper(BaseScraper):
-    """Scraper especializado para o Pelando."""
+    """Scraper do Pelando via JSON-LD e extração da página principal."""
 
     STORE = Store.PELANDO
     NAME = "pelando"
     BASE_URL = "https://www.pelando.com.br"
 
-    _HOT_DEALS_URL = "https://www.pelando.com.br"
-    _NEW_DEALS_URL = "https://www.pelando.com.br/novas"
+    PAGES = [
+        "https://www.pelando.com.br/recentes",
+        "https://www.pelando.com.br",
+    ]
+
+    EXTRA_HEADERS = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://www.pelando.com.br/",
+    }
+
+    def __init__(self, http_client: HttpClient, cache: TTLCache):
+        super().__init__(http_client, cache)
 
     async def _scrape(self) -> list[Product]:
-        """Coleta promoções do Pelando."""
+        """Coleta ofertas do Pelando extraindo dados da página principal."""
+        products: list[Product] = []
+        seen_urls: set[str] = set()
+
+        for page_url in self.PAGES:
+            html = await self._http.fetch(page_url, headers=self.EXTRA_HEADERS)
+            if not html:
+                self._logger.warning(f"Falha ao acessar {page_url}")
+                continue
+
+            # Estratégia 1: Extrair ofertas do JSON-LD com dados inline
+            json_ld_products = self._extract_from_json_ld(html, seen_urls)
+            products.extend(json_ld_products)
+
+            # Estratégia 2: Extrair ofertas dos links + títulos do HTML
+            html_products = self._extract_from_html(html, seen_urls)
+            products.extend(html_products)
+
+            if products:
+                break  # Se já encontrou ofertas, não precisa tentar outra página
+
+        self._logger.info(f"Pelando: {len(products)} ofertas coletadas")
+        return products
+
+    def _extract_from_json_ld(self, html: str, seen_urls: set[str]) -> list[Product]:
+        """Extrai ofertas do JSON-LD (application/ld+json)."""
         products: list[Product] = []
 
-        # Coleta ofertas quentes (mais votadas)
-        hot = await self._scrape_page(self._HOT_DEALS_URL)
-        products.extend(hot)
+        try:
+            pattern = r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>'
+            matches = re.findall(pattern, html, re.DOTALL)
 
-        # Coleta ofertas novas
-        new = await self._scrape_page(self._NEW_DEALS_URL)
-        products.extend(new)
+            for match in matches:
+                try:
+                    data = json.loads(match)
+                except json.JSONDecodeError:
+                    continue
+
+                # Processa diferentes estruturas JSON-LD
+                items = self._extract_json_ld_items(data)
+
+                for item in items:
+                    url = ""
+                    name = ""
+
+                    if isinstance(item, dict):
+                        url = item.get("url", "") or item.get("@id", "")
+                        name = item.get("name", "") or item.get("headline", "")
+
+                        # Tenta extrair de item aninhado
+                        if not name:
+                            inner = item.get("item", {})
+                            if isinstance(inner, dict):
+                                url = url or inner.get("url", "")
+                                name = inner.get("name", "")
+
+                    if not url or url in seen_urls:
+                        continue
+                    if "pelando.com.br" not in url:
+                        continue
+
+                    seen_urls.add(url)
+
+                    # Extrai preço do nome se possível
+                    price = self._extract_price_from_text(name)
+
+                    if name and len(name) >= 10:
+                        products.append(Product(
+                            title=self._clean_title(name),
+                            link=url,
+                            store=self.STORE,
+                            price=price,
+                            extra={"source": "pelando_json_ld"},
+                        ))
+
+        except Exception as e:
+            self._logger.debug(f"Erro ao extrair JSON-LD: {e}")
 
         return products
 
-    async def _scrape_page(self, url: str) -> list[Product]:
-        """Coleta ofertas de uma página do Pelando."""
-        products = []
+    def _extract_json_ld_items(self, data) -> list:
+        """Extrai itens de diferentes estruturas JSON-LD."""
+        items = []
+
+        if isinstance(data, list):
+            for entry in data:
+                items.extend(self._extract_json_ld_items(entry))
+            return items
+
+        if not isinstance(data, dict):
+            return items
+
+        # mainEntity.hasPart
+        main_entity = data.get("mainEntity", {})
+        if isinstance(main_entity, dict):
+            parts = main_entity.get("hasPart", [])
+            if isinstance(parts, list):
+                items.extend(parts)
+
+        # itemListElement
+        item_list = data.get("itemListElement", [])
+        if isinstance(item_list, list):
+            items.extend(item_list)
+
+        # Se o próprio item tem URL de oferta
+        if data.get("@type") in ("Product", "Offer", "Deal", "ListItem"):
+            items.append(data)
+
+        return items
+
+    def _extract_from_html(self, html: str, seen_urls: set[str]) -> list[Product]:
+        """Extrai ofertas diretamente do HTML usando regex."""
+        products: list[Product] = []
 
         try:
-            html = await self._http.fetch(url)
-            if not html:
-                return products
-
+            from bs4 import BeautifulSoup
             soup = BeautifulSoup(html, "html.parser")
 
-            # Cards de oferta do Pelando
-            card_selectors = [
-                "article",
-                "[class*='threadGrid']",
-                "[class*='thread-card']",
-                ".cept-thread-item",
-            ]
+            # Busca links de ofertas
+            offer_links = soup.select("a[href*='/d/']")
 
-            cards = []
-            for selector in card_selectors:
-                cards = soup.select(selector)
-                if cards:
-                    break
+            for link_el in offer_links:
+                href = link_el.get("href", "")
+                if not href:
+                    continue
+                if not href.startswith("http"):
+                    href = f"https://www.pelando.com.br{href}"
 
-            for card in cards[:20]:
-                product = self._parse_pelando_card(card)
-                if product:
-                    products.append(product)
+                if href in seen_urls:
+                    continue
+                if "/d/" not in href:
+                    continue
 
-            self._logger.info(f"Pelando ({url.split('/')[-1] or 'home'}): {len(products)} ofertas")
+                # Extrai título do link ou de elementos próximos
+                title = link_el.get_text(strip=True)
+
+                # Se o título é muito curto, tenta pegar do parent
+                if len(title) < 15:
+                    parent = link_el.parent
+                    if parent:
+                        # Busca texto mais longo no parent
+                        for child in parent.children:
+                            text = child.get_text(strip=True) if hasattr(child, 'get_text') else str(child).strip()
+                            if len(text) > len(title):
+                                title = text
+
+                if not title or len(title) < 10:
+                    continue
+
+                seen_urls.add(href)
+
+                price = self._extract_price_from_text(title)
+
+                products.append(Product(
+                    title=self._clean_title(title),
+                    link=href,
+                    store=self.STORE,
+                    price=price,
+                    extra={"source": "pelando_html"},
+                ))
 
         except Exception as e:
-            self._logger.warning(f"Erro no Pelando: {e}")
+            self._logger.debug(f"Erro ao extrair HTML: {e}")
 
         return products
 
-    def _parse_pelando_card(self, card) -> Optional[Product]:
-        """Parseia um card de oferta do Pelando."""
-        try:
-            # Extrai link principal
-            link_el = card.select_one("a[href*='/oferta/'], a[href*='/cupom/'], a[href*='/promocao/']")
-            if not link_el:
-                link_el = card.select_one("a[href]")
-
-            if not link_el:
-                return None
-
-            href = link_el.get("href", "")
-            if not href:
-                return None
-            if not href.startswith("http"):
-                href = f"https://www.pelando.com.br{href}"
-
-            # Extrai título
-            title_el = card.select_one(
-                "[class*='thread-title'], [class*='threadTitle'], "
-                "strong, h2, h3, .cept-tt"
-            )
-            title = title_el.get_text(strip=True) if title_el else link_el.get_text(strip=True)
-
-            if not title or len(title) < 10:
-                return None
-
-            # Extrai preço
-            price = None
-            price_el = card.select_one(
-                "[class*='thread-price'], [class*='threadPrice'], "
-                "[class*='price'], .cept-tp"
-            )
-            if price_el:
-                price = self._parse_price(price_el.get_text(strip=True))
-
-            # Tenta extrair preço do título
-            if price is None:
-                price_match = re.search(r"R\$\s*[\d.,]+", title)
-                if price_match:
-                    price = self._parse_price(price_match.group(0))
-
-            # Extrai desconto
-            discount = None
-            discount_el = card.select_one("[class*='discount'], [class*='badge']")
-            if discount_el:
-                disc_text = discount_el.get_text(strip=True)
-                disc_match = re.search(r"(\d+)\s*%", disc_text)
-                if disc_match:
-                    discount = float(disc_match.group(1))
-
-            # Extrai cupom se houver
-            coupon = None
-            coupon_el = card.select_one("[class*='voucher'], [class*='coupon'], code")
-            if coupon_el:
-                coupon = coupon_el.get_text(strip=True)
-
-            # Temperatura (votos) como indicador de qualidade
-            temp_el = card.select_one(
-                "[class*='vote'], [class*='temperature'], [class*='temp']"
-            )
-            score = 0.0
-            if temp_el:
-                temp_text = temp_el.get_text(strip=True)
-                temp_match = re.search(r"[\d.]+", temp_text.replace(",", "."))
-                if temp_match:
-                    score = float(temp_match.group(0))
-
-            return Product(
-                title=self._clean_title(title),
-                link=href,
-                store=self.STORE,
-                price=price,
-                discount_pct=discount,
-                coupon_code=coupon,
-                score=score,
-                extra={"source": "pelando"},
-            )
-
-        except Exception as e:
-            self._logger.debug(f"Erro ao parsear card Pelando: {e}")
+    def _extract_price_from_text(self, text: str) -> Optional[float]:
+        """Extrai preço de um texto."""
+        if not text:
             return None
+        # Busca padrão de preço brasileiro
+        match = re.search(r'R\$\s*([\d\.]+,\d{2})', text)
+        if match:
+            return self._parse_price(f"R$ {match.group(1)}")
+        return None

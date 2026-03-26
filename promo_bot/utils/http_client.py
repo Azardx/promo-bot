@@ -3,6 +3,7 @@ Cliente HTTP robusto e assíncrono do PromoBot.
 
 Implementa requisições com rotação de User-Agent, suporte a proxies,
 retry com backoff exponencial e controle de rate limit.
+Inclui fallback via curl_cffi para sites com TLS fingerprinting.
 """
 
 from __future__ import annotations
@@ -19,20 +20,27 @@ from promo_bot.utils.proxy import ProxyManager
 
 logger = get_logger("http_client")
 
+# Verifica se curl_cffi está disponível para fallback
+try:
+    from curl_cffi.requests import AsyncSession as CurlSession
+    HAS_CURL_CFFI = True
+except ImportError:
+    HAS_CURL_CFFI = False
+
 # ---------------------------------------------------------------------------
 # Pool de User-Agents realistas (Chrome, Firefox, Edge — versões recentes)
 # ---------------------------------------------------------------------------
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:133.0) Gecko/20100101 Firefox/133.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0",
 ]
 
 # Headers base que simulam um navegador real
@@ -50,6 +58,16 @@ BASE_HEADERS = {
     "Cache-Control": "max-age=0",
 }
 
+# Domínios que requerem curl_cffi (TLS fingerprinting)
+CURL_CFFI_DOMAINS = {
+    "www.pelando.com.br",
+    "pelando.com.br",
+    "www.amazon.com.br",
+    "amazon.com.br",
+    "shopee.com.br",
+    "www.shopee.com.br",
+}
+
 
 def _random_headers(extra: Optional[dict] = None) -> dict:
     """Gera headers com User-Agent aleatório."""
@@ -64,7 +82,8 @@ class HttpClient:
     Cliente HTTP assíncrono com retry, proxy e rate limit.
 
     Encapsula httpx.AsyncClient com funcionalidades adicionais
-    para scraping robusto e resiliente.
+    para scraping robusto e resiliente. Usa curl_cffi como
+    fallback para sites com TLS fingerprinting.
     """
 
     def __init__(
@@ -100,6 +119,69 @@ class HttpClient:
         except Exception:
             return url
 
+    def _should_use_curl(self, domain: str) -> bool:
+        """Verifica se deve usar curl_cffi para o domínio."""
+        return HAS_CURL_CFFI and domain in CURL_CFFI_DOMAINS
+
+    async def _fetch_with_curl(
+        self,
+        url: str,
+        method: str = "GET",
+        headers: Optional[dict] = None,
+        params: Optional[dict] = None,
+    ) -> Optional[str]:
+        """Faz requisição usando curl_cffi (bypassa TLS fingerprinting)."""
+        req_headers = _random_headers(headers)
+        last_error = None
+
+        # Impersonate Chrome para bypass de TLS fingerprinting
+        impersonate_options = ["chrome131", "chrome124", "chrome120", "chrome116"]
+
+        for attempt in range(self._max_retries):
+            try:
+                impersonate = impersonate_options[attempt % len(impersonate_options)]
+
+                async with CurlSession() as session:
+                    response = await session.request(
+                        method=method,
+                        url=url,
+                        headers=req_headers,
+                        params=params,
+                        timeout=self._timeout,
+                        impersonate=impersonate,
+                        allow_redirects=True,
+                    )
+
+                    if response.status_code in (403, 429, 503):
+                        logger.warning(
+                            f"Bloqueio {response.status_code} via curl em "
+                            f"{self._extract_domain(url)} (tentativa {attempt + 1})"
+                        )
+                        wait_time = (2 ** attempt) + random.uniform(1, 3)
+                        await asyncio.sleep(wait_time)
+                        req_headers = _random_headers(headers)
+                        continue
+
+                    if response.status_code >= 400:
+                        logger.warning(f"HTTP {response.status_code} via curl em {url}")
+                        last_error = f"HTTP {response.status_code}"
+                        continue
+
+                    self._request_count += 1
+                    return response.text
+
+            except Exception as e:
+                logger.warning(f"Erro curl em {url}: {type(e).__name__}: {e}")
+                last_error = str(e)
+
+            if attempt < self._max_retries - 1:
+                wait_time = (2 ** attempt) + random.uniform(0.5, 2)
+                await asyncio.sleep(wait_time)
+
+        self._error_count += 1
+        logger.error(f"Falha curl apos {self._max_retries} tentativas em {url}: {last_error}")
+        return None
+
     async def fetch(
         self,
         url: str,
@@ -111,6 +193,8 @@ class HttpClient:
     ) -> Optional[str]:
         """
         Realiza uma requisição HTTP com retry e proxy.
+
+        Para domínios com TLS fingerprinting, usa curl_cffi automaticamente.
 
         Args:
             url: URL de destino.
@@ -125,6 +209,14 @@ class HttpClient:
         """
         domain = self._extract_domain(url)
         await self._wait_rate_limit(domain)
+
+        # Usa curl_cffi para domínios com TLS fingerprinting
+        if self._should_use_curl(domain) and json_data is None:
+            result = await self._fetch_with_curl(url, method, headers, params)
+            if result is not None:
+                return result
+            # Se curl falhou, tenta com httpx como fallback
+            logger.debug(f"curl_cffi falhou para {domain}, tentando httpx")
 
         req_headers = _random_headers(headers)
         last_error = None
@@ -230,4 +322,5 @@ class HttpClient:
             "error_rate": (
                 f"{self._error_count / max(self._request_count, 1) * 100:.1f}%"
             ),
+            "curl_cffi_available": HAS_CURL_CFFI,
         }

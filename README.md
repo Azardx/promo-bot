@@ -6,8 +6,19 @@ Desenvolvido com foco em robustez e performance, o bot utiliza técnicas moderna
 
 ## 🌟 Funcionalidades Principais
 
-- **Coleta Multi-Fonte:** Scrapers integrados para Shopee, AliExpress, Amazon, KaBuM!, Pelando e Promobit.
-- **Motor Assíncrono:** Coleta concorrente de todas as fontes utilizando `httpx` com suporte a HTTP/2.
+- **Coleta Multi-Fonte:** Scrapers integrados para KaBuM!, Promobit, Pelando, AliExpress, Amazon e Shopee.
+- **Motor Assíncrono:** Coleta concorrente de todas as fontes utilizando `httpx` com suporte a HTTP/2 e fallback via `curl_cffi`.
+
+### Status dos Scrapers
+
+| Loja | Método | Status |
+|------|--------|--------|
+| **KaBuM!** | API pública de catálogo | ✅ Estável |
+| **Promobit** | SSR via `__NEXT_DATA__` | ✅ Estável |
+| **Pelando** | JSON-LD + HTML parsing | ✅ Estável (com `curl_cffi`) |
+| **AliExpress** | JSON embutido + HTML | ✅ Funcional |
+| **Amazon** | HTML parsing + `curl_cffi` | ⚠️ Proteção forte |
+| **Shopee** | JSON embutido + HTML | ⚠️ SPA (limitado) |
 - **Filtros Inteligentes:** Remoção automática de produtos de baixa qualidade, spam e ofertas fora da faixa de preço desejada.
 - **Deduplicação em 3 Camadas:** Verificação no batch atual, cache em memória (LRU com TTL) e banco de dados SQLite para garantir que nenhuma oferta seja enviada duas vezes.
 - **Sistema de Scoring:** Priorização de ofertas baseada em desconto, categoria, loja e palavras-chave.
@@ -24,7 +35,7 @@ O projeto segue uma arquitetura modular e limpa:
 - `database/`: Modelos de dados (`models.py`) e operações assíncronas com SQLite (`db.py`).
 - `scrapers/`: Scrapers específicos por loja, herdando de uma classe base robusta.
 - `services/`: Lógica de negócio (Filtros, Deduplicação, Scoring, Motor Principal e Telegram).
-- `utils/`: Utilitários compartilhados (Cache, HTTP Client, Logger, Proxy Manager).
+- `utils/`: Utilitários compartilhados (Cache, HTTP Client com curl_cffi, Logger, Proxy Manager).
 
 ## 🚀 Como Instalar e Executar
 
@@ -54,6 +65,7 @@ O projeto segue uma arquitetura modular e limpa:
    ```bash
    pip install -r requirements.txt
    ```
+   > **Nota:** O pacote `curl_cffi` é altamente recomendado para melhor compatibilidade com Pelando, Amazon e Shopee. Ele faz bypass de TLS fingerprinting automaticamente.
 
 4. Configure as variáveis de ambiente:
    ```bash
@@ -98,6 +110,15 @@ O sistema possui um logger profissional configurado para exibir mensagens colori
 ## 🤝 Contribuição
 
 Contribuições são bem-vindas! Sinta-se à vontade para abrir issues ou enviar pull requests com melhorias, novos scrapers ou correções de bugs.
+
+## 🔧 Notas Técnicas
+
+- O **KaBuM!** e o **Promobit** são as fontes mais confiáveis por usarem APIs públicas/SSR.
+- O **Pelando** funciona melhor com `curl_cffi` instalado (bypass de TLS fingerprinting).
+- **Amazon** e **Shopee** possuem proteção anti-bot forte; podem não funcionar sem proxy.
+- O bot usa `curl_cffi` automaticamente para domínios com TLS fingerprinting.
+- Sem `curl_cffi`, o bot ainda funciona perfeitamente com KaBuM, Promobit e AliExpress.
+- O filtro de preço mínimo padrão é R$ 1,00 para não bloquear ofertas legítimas.
 
 ## 📝 Licença
 

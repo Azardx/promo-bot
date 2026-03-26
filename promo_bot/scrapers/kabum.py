@@ -1,265 +1,189 @@
 """
-Scraper de promoções do KaBuM!
+Scraper do KaBuM! usando a API pública de catálogo.
 
-O KaBuM! é uma das maiores lojas de tecnologia do Brasil.
-Coleta ofertas da página de promoções e ofertas do dia
-via parsing HTML e API interna.
+Acessa a API REST oficial de catálogo do KaBuM! para coletar
+produtos em oferta com preços, descontos e informações completas.
 """
 
 from __future__ import annotations
 
-import json
 import re
 from typing import Optional
 
-from bs4 import BeautifulSoup
-
 from promo_bot.database.models import Product, Store
 from promo_bot.scrapers.base import BaseScraper
+from promo_bot.utils.cache import TTLCache
+from promo_bot.utils.http_client import HttpClient
 
 
 class KabumScraper(BaseScraper):
-    """Scraper especializado para o KaBuM!"""
+    """Scraper do KaBuM! via API pública de catálogo."""
 
     STORE = Store.KABUM
     NAME = "kabum"
-    BASE_URL = "https://www.kabum.com.br"
+    BASE_URL = "https://servicespub.prod.api.aws.grupokabum.com.br"
 
-    _OFFERS_URL = "https://www.kabum.com.br/ofertas"
-    _HOTOFFERS_URL = "https://www.kabum.com.br/hotoffers"
-    _API_URL = "https://servicespub.prod.api.aws.grupokabum.com.br/home/v1/offer"
-    _SEARCH_API = "https://servicespub.prod.api.aws.grupokabum.com.br/catalog/v2/products"
+    CATALOG_URL = "{base}/catalog/v2/products"
+    PRODUCT_URL = "https://www.kabum.com.br/produto/{slug}"
+
+    # Headers que a API aceita
+    API_HEADERS = {
+        "Accept": "application/json",
+        "Referer": "https://www.kabum.com.br/",
+        "Origin": "https://www.kabum.com.br",
+    }
+
+    def __init__(self, http_client: HttpClient, cache: TTLCache):
+        super().__init__(http_client, cache)
 
     async def _scrape(self) -> list[Product]:
-        """Coleta promoções do KaBuM!"""
+        """Coleta ofertas do KaBuM! via API de catálogo."""
         products: list[Product] = []
 
-        # Estratégia 1: API interna de ofertas
-        api_products = await self._scrape_api()
-        products.extend(api_products)
+        # Busca 1: Produtos em oferta (mais buscados)
+        offer_products = await self._fetch_catalog(
+            has_offer="true", sort="most_searched", page_size=20
+        )
+        products.extend(offer_products)
 
-        # Estratégia 2: Página de ofertas via HTML
-        html_products = await self._scrape_html()
-        products.extend(html_products)
+        # Busca 2: Ofertas do dia (stamp específico)
+        daily_products = await self._fetch_catalog(
+            highlighted_stamp="Ofertas do Dia", sort="most_searched", page_size=15
+        )
+        # Evita duplicatas por ID
+        seen_links = {p.link for p in products}
+        for p in daily_products:
+            if p.link not in seen_links:
+                products.append(p)
+                seen_links.add(p.link)
+
+        self._logger.info(f"KaBuM: {len(products)} ofertas coletadas no total")
+        return products
+
+    async def _fetch_catalog(
+        self,
+        has_offer: str = "",
+        highlighted_stamp: str = "",
+        sort: str = "most_searched",
+        page_size: int = 20,
+    ) -> list[Product]:
+        """Busca produtos na API de catálogo com filtros."""
+        products: list[Product] = []
+        url = self.CATALOG_URL.format(base=self.BASE_URL)
+
+        params = {
+            "page_number": "1",
+            "page_size": str(page_size),
+            "sort": sort,
+        }
+        if has_offer:
+            params["has_offer"] = has_offer
+        if highlighted_stamp:
+            params["highlighted_stamp"] = highlighted_stamp
+
+        data = await self._http.fetch_json(url, headers=self.API_HEADERS, params=params)
+        if not data:
+            self._logger.warning("Falha ao acessar API do KaBuM")
+            return products
+
+        items = data.get("data", [])
+        if not isinstance(items, list):
+            self._logger.warning("Formato inesperado da API do KaBuM")
+            return products
+
+        self._logger.debug(f"KaBuM API retornou {len(items)} itens")
+
+        for item in items:
+            try:
+                product = self._parse_product(item)
+                if product:
+                    products.append(product)
+            except Exception as e:
+                self._logger.debug(f"Erro ao parsear produto KaBuM: {e}")
 
         return products
 
-    async def _scrape_api(self) -> list[Product]:
-        """Coleta via API interna do KaBuM."""
-        products = []
-
-        try:
-            headers = {
-                "Referer": "https://www.kabum.com.br/",
-                "Accept": "application/json",
-                "Origin": "https://www.kabum.com.br",
-            }
-
-            # Tenta API de ofertas
-            data = await self._http.fetch_json(self._API_URL, headers=headers)
-            if data:
-                items = data if isinstance(data, list) else data.get("data", [])
-                if isinstance(items, dict):
-                    items = items.get("offers", []) or items.get("products", [])
-
-                for item in items[:25]:
-                    product = self._parse_api_item(item)
-                    if product:
-                        products.append(product)
-
-            # Tenta API de busca com filtro de promoção
-            if not products:
-                params = {
-                    "query": "*",
-                    "page_number": "1",
-                    "page_size": "20",
-                    "sort": "most_searched",
-                    "is_offer": "true",
-                }
-                data = await self._http.fetch_json(
-                    self._SEARCH_API, headers=headers, params=params
-                )
-                if data and "data" in data:
-                    items = data["data"]
-                    if isinstance(items, list):
-                        for item in items[:20]:
-                            product = self._parse_api_item(item)
-                            if product:
-                                products.append(product)
-
-        except Exception as e:
-            self._logger.warning(f"Erro na API KaBuM: {e}")
-
-        return products
-
-    def _parse_api_item(self, item: dict) -> Optional[Product]:
-        """Parseia um item da API do KaBuM."""
-        try:
-            title = item.get("name", "") or item.get("title", "") or item.get("productName", "")
-            if not title:
-                return None
-
-            # Link
-            code = item.get("code") or item.get("id") or item.get("productId")
-            slug = item.get("slug", "")
-            link = item.get("link", "") or item.get("url", "")
-
-            if not link:
-                if code:
-                    link = f"https://www.kabum.com.br/produto/{code}"
-                    if slug:
-                        link += f"/{slug}"
-                else:
-                    return None
-
-            if not link.startswith("http"):
-                link = f"https://www.kabum.com.br{link}"
-
-            # Preços
-            price = None
-            original_price = None
-
-            price_data = item.get("priceWithDiscount") or item.get("offer_price") or item.get("price")
-            if isinstance(price_data, (int, float)):
-                price = float(price_data)
-            elif isinstance(price_data, dict):
-                price = float(price_data.get("value", 0))
-
-            orig_data = item.get("oldPrice") or item.get("price") or item.get("priceWithoutDiscount")
-            if isinstance(orig_data, (int, float)):
-                original_price = float(orig_data)
-            elif isinstance(orig_data, dict):
-                original_price = float(orig_data.get("value", 0))
-
-            # Desconto
-            discount = item.get("discount") or item.get("discountPercentage")
-            if isinstance(discount, str):
-                disc_match = re.search(r"(\d+)", discount)
-                discount = float(disc_match.group(1)) if disc_match else None
-
-            # Imagem
-            image = item.get("imageUrl", "") or item.get("image", "")
-
-            return Product(
-                title=self._clean_title(title),
-                link=link,
-                store=self.STORE,
-                price=price,
-                original_price=original_price,
-                discount_pct=float(discount) if discount else None,
-                image_url=image,
-            )
-        except Exception as e:
-            self._logger.debug(f"Erro ao parsear item KaBuM API: {e}")
+    def _parse_product(self, item: dict) -> Optional[Product]:
+        """Converte um item da API em Product."""
+        attrs = item.get("attributes", {})
+        if not attrs:
             return None
 
-    async def _scrape_html(self) -> list[Product]:
-        """Coleta via parsing HTML."""
-        products = []
-
-        try:
-            for url in [self._OFFERS_URL, self._HOTOFFERS_URL]:
-                html = await self._http.fetch(url)
-                if not html:
-                    continue
-
-                soup = BeautifulSoup(html, "html.parser")
-
-                # Tenta extrair dados JSON embutidos
-                script_tags = soup.select("script[type='application/json'], script#__NEXT_DATA__")
-                for script in script_tags:
-                    try:
-                        data = json.loads(script.string or "")
-                        items = self._extract_items_from_next_data(data)
-                        for item in items[:20]:
-                            product = self._parse_api_item(item)
-                            if product:
-                                products.append(product)
-                    except (json.JSONDecodeError, TypeError):
-                        continue
-
-                # Fallback: parsing de cards HTML
-                if not products:
-                    card_selectors = [
-                        ".productCard",
-                        "[class*='productCard']",
-                        ".product-card",
-                        "a.prod-name",
-                    ]
-                    for selector in card_selectors:
-                        cards = soup.select(selector)
-                        if cards:
-                            for card in cards[:20]:
-                                product = self._parse_html_card(card)
-                                if product:
-                                    products.append(product)
-                            break
-
-                if products:
-                    break
-
-        except Exception as e:
-            self._logger.warning(f"Erro no HTML KaBuM: {e}")
-
-        return products
-
-    def _extract_items_from_next_data(self, data: dict) -> list[dict]:
-        """Extrai itens de __NEXT_DATA__ do Next.js."""
-        items = []
-        try:
-            props = data.get("props", {}).get("pageProps", {})
-            # Tenta diferentes caminhos
-            for key in ["products", "offers", "data", "catalog"]:
-                found = props.get(key, [])
-                if isinstance(found, list) and found:
-                    items = found
-                    break
-                if isinstance(found, dict):
-                    items = found.get("products", []) or found.get("data", [])
-                    if items:
-                        break
-        except Exception:
-            pass
-        return items
-
-    def _parse_html_card(self, card) -> Optional[Product]:
-        """Parseia um card HTML do KaBuM."""
-        try:
-            # Link
-            if card.name == "a":
-                link_el = card
-            else:
-                link_el = card.select_one("a[href]")
-
-            if not link_el:
-                return None
-
-            href = link_el.get("href", "")
-            if not href:
-                return None
-            if not href.startswith("http"):
-                href = f"https://www.kabum.com.br{href}"
-
-            # Título
-            title_el = card.select_one(
-                "[class*='name'], [class*='title'], h3, h2, span.name"
-            )
-            title = title_el.get_text(strip=True) if title_el else link_el.get_text(strip=True)
-
-            if not title or len(title) < 10:
-                return None
-
-            # Preço
-            price_el = card.select_one(
-                "[class*='priceCard'], [class*='finalPrice'], .price"
-            )
-            price = self._parse_price(price_el.get_text(strip=True)) if price_el else None
-
-            return Product(
-                title=self._clean_title(title),
-                link=href,
-                store=self.STORE,
-                price=price,
-            )
-        except Exception:
+        title = attrs.get("title", "").strip()
+        if not title:
             return None
+
+        # Monta link do produto
+        product_slug = attrs.get("product_link", "")
+        if not product_slug:
+            return None
+        link = self.PRODUCT_URL.format(slug=product_slug)
+
+        # Preços — prioriza preço de oferta
+        offer = attrs.get("offer") or {}
+        if offer and offer.get("price"):
+            price = offer.get("price_with_discount") or offer.get("price")
+            original_price = attrs.get("price")
+            discount_pct = offer.get("discount_percentage")
+        else:
+            price = attrs.get("price_with_discount") or attrs.get("price")
+            original_price = attrs.get("old_price")
+            discount_pct = attrs.get("discount_percentage")
+
+        # Converte preços
+        price = float(price) if price else None
+        if original_price:
+            original_price = float(original_price)
+            if original_price <= 0 or (price and original_price <= price):
+                original_price = None
+        if discount_pct:
+            discount_pct = float(discount_pct)
+
+        # Imagem
+        images = attrs.get("images", [])
+        image_url = images[0] if images else ""
+
+        # Frete grátis
+        free_shipping = bool(attrs.get("has_free_shipping", False))
+
+        # Cupom (extraído dos stamps)
+        coupon = self._extract_coupon(attrs.get("stamps", []))
+
+        # Categoria
+        menu = attrs.get("menu", "")
+        category = menu.split("/")[0] if menu else ""
+
+        return Product(
+            title=self._clean_title(title),
+            link=link,
+            store=self.STORE,
+            price=price,
+            original_price=original_price,
+            discount_pct=discount_pct,
+            category=category,
+            image_url=image_url,
+            coupon_code=coupon,
+            free_shipping=free_shipping,
+        )
+
+    def _extract_coupon(self, stamps: list) -> Optional[str]:
+        """Extrai código de cupom dos stamps do produto."""
+        if not stamps:
+            return None
+
+        for stamp in stamps:
+            stamp_title = ""
+            if isinstance(stamp, dict):
+                stamp_title = stamp.get("title", "") or stamp.get("name", "")
+            elif isinstance(stamp, str):
+                stamp_title = stamp
+
+            upper = stamp_title.upper()
+            if "CUPOM" in upper:
+                # Extrai o código do cupom (ex: "CUPOM SHARK15" -> "SHARK15")
+                match = re.search(r"CUPOM\s+(\S+)", stamp_title, re.IGNORECASE)
+                if match:
+                    return match.group(1)
+                return stamp_title.strip()
+
+        return None

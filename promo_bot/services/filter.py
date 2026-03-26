@@ -3,6 +3,9 @@ Serviço de filtragem inteligente de promoções.
 
 Aplica múltiplos critérios de filtragem para garantir que apenas
 promoções relevantes e de qualidade sejam enviadas aos usuários.
+
+NOTA: O filtro é intencionalmente permissivo para não bloquear
+ofertas legítimas. A priorização é feita pelo scorer.
 """
 
 from __future__ import annotations
@@ -22,16 +25,14 @@ SPAM_PATTERNS = [
     r"(?i)produto\s+indispon[ií]vel",
     r"(?i)fora\s+de\s+estoque",
     r"(?i)esgotado",
-    r"(?i)apenas\s+\d+\s+unidade",
-    r"(?i)compre\s+\d+\s+leve\s+\d+",  # Geralmente enganoso
 ]
 
 # Palavras que indicam produtos genéricos/irrelevantes
+# (lista reduzida — apenas itens realmente irrelevantes)
 LOW_QUALITY_WORDS = [
-    "capinha", "película", "adesivo", "suporte celular",
-    "cabo usb", "manual", "pdf", "amostra", "grátis",
-    "brinde", "miniatura", "chaveiro", "etiqueta",
-    "capa de silicone", "protetor de tela genérico",
+    "amostra grátis",
+    "manual pdf",
+    "etiqueta adesiva",
 ]
 
 
@@ -45,17 +46,15 @@ class ProductFilter:
 
     def __init__(
         self,
-        min_price: float = 10.0,
+        min_price: float = 1.0,
         max_price: float = 50000.0,
         blocked_keywords: Optional[list[str]] = None,
-        min_title_length: int = 15,
-        min_discount_pct: float = 5.0,
+        min_title_length: int = 10,
     ):
         self._min_price = min_price
         self._max_price = max_price
         self._blocked_keywords = blocked_keywords or settings.blocked_keywords
         self._min_title_length = min_title_length
-        self._min_discount_pct = min_discount_pct
         self._filtered_count = 0
         self._passed_count = 0
 
@@ -100,20 +99,20 @@ class ProductFilter:
         if not product.link or not product.link.startswith("http"):
             return "link_invalido"
 
-        # 3. Filtro de preço
+        # 3. Filtro de preço (apenas se preço existir)
         if product.price is not None:
             if product.price < self._min_price:
                 return f"preco_baixo ({product.price:.2f})"
             if product.price > self._max_price:
                 return f"preco_alto ({product.price:.2f})"
 
-        # 4. Palavras bloqueadas
+        # 4. Palavras bloqueadas pelo usuário
         title_lower = product.title.lower()
         for keyword in self._blocked_keywords:
             if keyword.lower() in title_lower:
                 return f"palavra_bloqueada ({keyword})"
 
-        # 5. Palavras de baixa qualidade
+        # 5. Palavras de baixa qualidade (apenas combinações específicas)
         for word in LOW_QUALITY_WORDS:
             if word.lower() in title_lower:
                 return f"baixa_qualidade ({word})"
@@ -124,8 +123,8 @@ class ProductFilter:
                 return "spam_detectado"
 
         # 7. Título com muitos caracteres especiais (spam)
-        special_chars = sum(1 for c in product.title if not c.isalnum() and c not in " .,/-()[]")
-        if special_chars > len(product.title) * 0.3:
+        special_chars = sum(1 for c in product.title if not c.isalnum() and c not in " .,/-()[]!@#$%&*+:;'\"")
+        if len(product.title) > 0 and special_chars > len(product.title) * 0.4:
             return "excesso_caracteres_especiais"
 
         # 8. Título duplicado/genérico
@@ -139,7 +138,6 @@ class ProductFilter:
         generic_patterns = [
             r"^(produto|item|oferta|promoção)\s*\d*$",
             r"^[\d\s.,R$]+$",  # Apenas números e preço
-            r"^.{1,10}$",  # Muito curto
         ]
         for pattern in generic_patterns:
             if re.match(pattern, title.strip(), re.IGNORECASE):
