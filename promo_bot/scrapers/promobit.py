@@ -1,72 +1,155 @@
-import logging
-from selectolax.parser import HTMLParser
-from http_client import fetch
+"""
+Scraper de promoções do Promobit.
 
-logger = logging.getLogger("scraper_promobit")
+O Promobit é outro agregador de promoções brasileiro com forte
+comunidade. Coleta ofertas de diversas categorias com preços
+já validados pelos usuários.
+"""
 
-async def scrap_promobit():
-    ofertas = []
-    try:
-        # Foca na página de informática
-        html = await fetch("https://www.promobit.com.br/promocoes/informatica/")
-        if not html:
-            logger.warning("Promobit retornou HTML vazio.")
-            return []
-            
-        tree = HTMLParser(html)
-        
-        # Procura os "cards" de produto que englobam a oferta
-        for card in tree.css(".pr-product-card"):
-            # Extrai o link de redirecionamento interno
-            link_node = card.css_first("a[href*='/oferta/']")
-            if not link_node:
-                continue
-                
-            titulo_sujo = link_node.text(strip=True)
-            link_promobit = link_node.attributes.get("href")
-            
-            # Tenta encontrar o preço, muitas vezes vem numa span ou b
-            preco = ""
-            preco_node = card.css_first(".pr-product-card-price, .pr-font-bold") 
-            if preco_node:
-                preco = preco_node.text(strip=True)
+from __future__ import annotations
 
-            # Evita capturar botões genéricos
-            if link_promobit and titulo_sujo and len(titulo_sujo) > 10: 
-                if not link_promobit.startswith("http"):
-                    link_promobit = "https://www.promobit.com.br" + link_promobit
+import re
+from typing import Optional
 
-                # 🚨 MAGIA DO LINK LIMPO: Acessar a página do Promobit e pegar o link externo
-                try:
-                    html_oferta = await fetch(link_promobit)
-                    if html_oferta:
-                        tree_oferta = HTMLParser(html_oferta)
-                        # O Promobit guarda o link externo da loja num botão de redirecionamento ou tag meta
-                        link_externo_node = tree_oferta.css_first("a.pr-action-btn, a.pr-buy-btn")
-                        
-                        if link_externo_node:
-                            link_final = link_externo_node.attributes.get("href")
-                        else:
-                            # Se não achar o botão, usa um fallback no HTML
-                            meta_link = tree_oferta.css_first("meta[property='og:url']")
-                            link_final = meta_link.attributes.get("content") if meta_link else link_promobit
-                    else:
-                        link_final = link_promobit
-                except Exception as ex_link:
-                    logger.debug(f"Falha ao extrair link limpo, usando original. {ex_link}")
-                    link_final = link_promobit
+from bs4 import BeautifulSoup
 
-                # Constrói um título legível juntando o preço e o nome, para não falhar na regex do main
-                titulo_final = f"{preco} - {titulo_sujo}" if preco else titulo_sujo
+from promo_bot.database.models import Product, Store
+from promo_bot.scrapers.base import BaseScraper
 
-                if not any(link_final == o[1] for o in ofertas):
-                    ofertas.append((titulo_final, link_final))
-            
-            if len(ofertas) >= 15:
-                break
-                
-        logger.info(f"Promobit: {len(ofertas)} ofertas encontradas.")
-    except Exception as e:
-        logger.error(f"Erro no Promobit: {e}")
-        
-    return ofertas
+
+class PromobitScraper(BaseScraper):
+    """Scraper especializado para o Promobit."""
+
+    STORE = Store.PROMOBIT
+    NAME = "promobit"
+    BASE_URL = "https://www.promobit.com.br"
+
+    _DEALS_URL = "https://www.promobit.com.br/promocoes"
+    _CATEGORIES = [
+        "informatica",
+        "eletronicos",
+        "celulares-e-smartphones",
+        "games",
+    ]
+
+    async def _scrape(self) -> list[Product]:
+        """Coleta promoções do Promobit."""
+        products: list[Product] = []
+
+        # Página principal de promoções
+        main_deals = await self._scrape_page(self._DEALS_URL)
+        products.extend(main_deals)
+
+        # Categorias específicas
+        for category in self._CATEGORIES[:2]:
+            cat_deals = await self._scrape_page(
+                f"{self._DEALS_URL}/{category}/"
+            )
+            products.extend(cat_deals)
+
+        return products
+
+    async def _scrape_page(self, url: str) -> list[Product]:
+        """Coleta ofertas de uma página do Promobit."""
+        products = []
+
+        try:
+            html = await self._http.fetch(url)
+            if not html:
+                return products
+
+            soup = BeautifulSoup(html, "html.parser")
+
+            # Seletores de cards do Promobit
+            card_selectors = [
+                ".pr-product-card",
+                "[class*='promotion-card']",
+                "[class*='PromotionCard']",
+                "article[class*='promo']",
+                ".cept-offer-card",
+            ]
+
+            cards = []
+            for selector in card_selectors:
+                cards = soup.select(selector)
+                if cards:
+                    break
+
+            # Fallback: links de ofertas
+            if not cards:
+                cards = soup.select("a[href*='/oferta/']")
+
+            for card in cards[:15]:
+                product = self._parse_promobit_card(card, soup)
+                if product:
+                    products.append(product)
+
+        except Exception as e:
+            self._logger.warning(f"Erro no Promobit ({url}): {e}")
+
+        return products
+
+    def _parse_promobit_card(self, card, soup) -> Optional[Product]:
+        """Parseia um card de oferta do Promobit."""
+        try:
+            # Extrai link
+            link_el = card.select_one("a[href*='/oferta/']")
+            if not link_el and card.name == "a":
+                link_el = card
+
+            if not link_el:
+                return None
+
+            href = link_el.get("href", "")
+            if not href:
+                return None
+            if not href.startswith("http"):
+                href = f"https://www.promobit.com.br{href}"
+
+            # Extrai título
+            title_el = card.select_one(
+                "[class*='product-card-title'], [class*='promotion-title'], "
+                "h3, h2, strong, .title"
+            )
+            title = title_el.get_text(strip=True) if title_el else link_el.get_text(strip=True)
+
+            if not title or len(title) < 10:
+                return None
+
+            # Extrai preço
+            price = None
+            price_el = card.select_one(
+                "[class*='product-card-price'], [class*='price'], "
+                ".pr-font-bold, [class*='Price']"
+            )
+            if price_el:
+                price = self._parse_price(price_el.get_text(strip=True))
+
+            # Tenta extrair preço do título
+            if price is None:
+                price_match = re.search(r"R\$\s*[\d.,]+", title)
+                if price_match:
+                    price = self._parse_price(price_match.group(0))
+
+            # Extrai loja de origem
+            store_el = card.select_one(
+                "[class*='store'], [class*='merchant'], .pr-store-name"
+            )
+            store_name = store_el.get_text(strip=True) if store_el else ""
+
+            # Constrói título com preço se disponível
+            display_title = title
+            if price and f"R$" not in title and f"r$" not in title.lower():
+                display_title = f"R$ {price:.2f} - {title}"
+
+            return Product(
+                title=self._clean_title(display_title),
+                link=href,
+                store=self.STORE,
+                price=price,
+                extra={"source": "promobit", "original_store": store_name},
+            )
+
+        except Exception as e:
+            self._logger.debug(f"Erro ao parsear card Promobit: {e}")
+            return None

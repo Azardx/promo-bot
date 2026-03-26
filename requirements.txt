@@ -1,0 +1,13 @@
+# Core
+aiogram>=3.4.1
+httpx[http2]>=0.27.0
+aiosqlite>=0.20.0
+python-dotenv>=1.0.1
+
+# Parsing
+beautifulsoup4>=4.12.3
+lxml>=5.1.0
+selectolax>=0.3.21
+
+# Utils
+curl_cffi>=0.6.2

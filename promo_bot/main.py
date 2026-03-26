@@ -1,210 +1,302 @@
+"""
+Ponto de entrada principal do PromoBot.
+
+Inicializa todos os componentes, configura o scheduler assíncrono
+e coordena a execução do bot com monitoramento de saúde.
+"""
+
+from __future__ import annotations
+
 import asyncio
-import logging
+import signal
+import sys
 import time
-import re
+from pathlib import Path
 
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import CommandStart, Command
-from aiogram.client.default import DefaultBotProperties
+# Adiciona o diretório pai ao path para imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from config import BOT_TOKEN, SCRAPE_INTERVAL, ADMIN_ID, GROUP_ID
-from database import init_db, promo_exists, add_promo, total_promos
-from services.promo_engine import coletar_promos
-from services.broadcast import broadcast
+from promo_bot.config import settings
+from promo_bot.database.db import Database
+from promo_bot.services.engine import PromoEngine
+from promo_bot.services.telegram import TelegramService
+from promo_bot.utils.cache import TTLCache
+from promo_bot.utils.http_client import HttpClient
+from promo_bot.utils.logger import setup_logging, get_logger
+from promo_bot.utils.proxy import ProxyManager
 
-# -------------------------
-# LOGGING PROFISSIONAL
-# -------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-)
-logger = logging.getLogger("promo_bot")
 
-# -------------------------
-# INICIALIZAÇÃO DO BOT
-# -------------------------
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(
-        parse_mode="HTML",
-        link_preview_is_disabled=True
-    )
-)
-dp = Dispatcher()
+# ---------------------------------------------------------------------------
+# Classe principal da aplicação
+# ---------------------------------------------------------------------------
+class PromoBot:
+    """
+    Aplicação principal do PromoBot.
 
-# Cache local para evitar enviar a mesma promo várias vezes no mesmo ciclo
-recent_links = set()
+    Orquestra a inicialização de todos os componentes, o ciclo
+    de coleta de promoções e o monitoramento de saúde do sistema.
+    """
 
-# -------------------------
-# DESIGN PREMIUM E LIMPEZA
-# -------------------------
-def limpar_titulo(titulo_sujo: str) -> str:
-    """Limpa o lixo que as lojas e agregadores colam no final dos títulos"""
-    t = titulo_sujo
-    lixos = ["Mercado Livre", "KaBuM!", "Amazon", "Terabyte", "Pichau", "Magazine Luiza", "Shopee", "AliExpress", "APPMemória"]
-    for lixo in lixos:
-        t = t.replace(lixo, " ")
-    
-    t = re.sub(r'[a-zA-ZÀ-ÿ]+\s*[a-zA-ZÀ-ÿ]*\d+\s*(min|h|d)\d*$', '', t)
-    t = re.sub(r'Frete GrátisParcelado', ' | Frete Grátis', t)
-    
-    return t.strip()
+    def __init__(self):
+        self._logger = get_logger("main")
+        self._running = False
+        self._start_time = 0.0
 
-def montar_texto(titulo_sujo):
-    titulo_limpo = limpar_titulo(titulo_sujo)
-    
-    match_preco = re.search(r'(R\$\s*[\d\.,]+)(.*?R\$\s*[\d\.,]+)?', titulo_limpo)
-    
-    if match_preco:
-        if match_preco.group(2):
-            preco_antigo = match_preco.group(1).strip()
-            preco_novo = match_preco.group(2).strip()
-            nome_produto = titulo_limpo.replace(match_preco.group(0), "").strip()
-            
-            return (
-                f"🚨 <b>OFERTA DETECTADA</b> 🚨\n\n"
-                f"📦 {nome_produto}\n\n"
-                f"❌ De: <s>{preco_antigo}</s>\n"
-                f"✅ Por: <b>{preco_novo}</b>\n\n"
-                f"🔗 Acesse o link abaixo:"
-            )
-        else:
-            preco = match_preco.group(1).strip()
-            nome_produto = titulo_limpo.replace(preco, "").strip()
-            return (
-                f"🔥 <b>OFERTA DETECTADA</b> 🔥\n\n"
-                f"📦 {nome_produto}\n\n"
-                f"💰 Valor: <b>{preco}</b>\n\n"
-                f"🔗 Acesse o link abaixo:"
-            )
-            
-    return (
-        f"⚡ <b>PROMOÇÃO ATIVA</b> ⚡\n\n"
-        f"🎯 {titulo_limpo}\n\n"
-        f"🔗 Confira no link abaixo:"
-    )
+        # Componentes (inicializados em start())
+        self._db: Database | None = None
+        self._cache: TTLCache | None = None
+        self._proxy_manager: ProxyManager | None = None
+        self._http_client: HttpClient | None = None
+        self._engine: PromoEngine | None = None
+        self._telegram: TelegramService | None = None
 
-def identificar_cupom(titulo: str):
-    t = titulo.upper()
-    if "CUPOM" not in t and "CÓDIGO" not in t:
-        return None
-        
-    match = re.search(r'(?:CUPOM|CÓDIGO|USE O|CÓD)[\s:]*([A-Z0-9]{4,20})', t)
-    if match:
-        return match.group(1)
-        
-    match_secundario = re.search(r'\b([A-Z]+[0-9]+[A-Z0-9]*)\b', t)
-    if match_secundario:
-         return match_secundario.group(1)
-         
-    return "APLICADO NO CARRINHO"
+    async def start(self) -> None:
+        """Inicializa e executa o bot."""
+        self._start_time = time.time()
+        self._logger.info("=" * 60)
+        self._logger.info("  PromoBot - Iniciando sistema...")
+        self._logger.info("=" * 60)
 
-def validar_link(link: str) -> bool:
-    return bool(link and link.startswith("http"))
+        # Valida configurações
+        errors = settings.validate()
+        if errors:
+            for error in errors:
+                self._logger.error(f"Configuracao: {error}")
+            self._logger.critical("Configuracoes invalidas. Abortando.")
+            sys.exit(1)
 
-def criar_teclado(link: str):
-    return types.InlineKeyboardMarkup(
-        inline_keyboard=[[types.InlineKeyboardButton(text="🛒 Abrir promoção", url=link)]]
-    )
-
-# -------------------------
-# COMANDOS
-# -------------------------
-@dp.message(CommandStart())
-async def start(msg: types.Message):
-    await msg.answer(
-        "👋 Olá! Eu sou um bot de promoções automatizado.\n\n"
-        "Eu envio as ofertas diretamente no canal oficial."
-    )
-
-@dp.message(Command("stats"))
-async def stats(msg: types.Message):
-    if msg.from_user.id != ADMIN_ID:
-        return
-    promos = await total_promos()
-    await msg.answer(f"📊 <b>Painel do Bot</b>\n\n🔥 Promos: {promos}\n🎯 Alvo: <code>{GROUP_ID}</code>")
-
-# -------------------------
-# PROCESSAMENTO DE OFERTAS
-# -------------------------
-async def processar_promo(titulo_sujo, link):
-    if not validar_link(link) or link in recent_links:
-        return
-
-    if await promo_exists(link):
-        return
-
-    await add_promo(link)
-    recent_links.add(link)
-
-    codigo_cupom = identificar_cupom(titulo_sujo)
-
-    if codigo_cupom:
-        texto = (
-            f"🎟️ <b>CUPOM DE DESCONTO ENCONTRADO!</b>\n\n"
-            f"📝 {titulo_sujo}\n\n"
-            f"✂️ Código: <code>{codigo_cupom}</code>\n"
-            f"<i>(Toque no código para copiar ☝️)</i>\n"
-        )
-        kb = types.InlineKeyboardMarkup(
-            inline_keyboard=[[types.InlineKeyboardButton(text="🛒 Resgatar Cupom", url=link)]]
-        )
-        logger.info(f"🎟️ Cupom enviado: {codigo_cupom}")
-    else:
-        texto = montar_texto(titulo_sujo)
-        kb = criar_teclado(link)
-        logger.info(f"🔥 Promo enviada: {titulo_sujo}")
-
-    await broadcast(bot, texto, kb)
-
-# -------------------------
-# MOTOR DE BUSCA (MONITOR)
-# -------------------------
-async def monitor():
-    logger.info("Monitor iniciado")
-    while True:
         try:
-            start_time = time.time()
-            promos = await coletar_promos()
-            
-            if not promos:
-                logger.info("Nenhuma promoção encontrada neste ciclo")
+            # 1. Banco de dados
+            self._db = Database(settings.db_path)
+            await self._db.connect()
+
+            # 2. Cache
+            self._cache = TTLCache(
+                max_size=settings.cache_max_size,
+                ttl=settings.cache_ttl,
+            )
+
+            # 3. Proxy Manager
+            self._proxy_manager = ProxyManager(
+                proxy_file=settings.proxy_list_file,
+                enabled=settings.use_proxies,
+            )
+            if self._proxy_manager.is_enabled:
+                self._logger.info(
+                    f"Proxies habilitados: {self._proxy_manager.available_count} disponiveis"
+                )
             else:
-                for titulo, link in promos:
-                    await processar_promo(titulo, link)
-                    await asyncio.sleep(0.35)
-                    
-            elapsed = round(time.time() - start_time, 2)
-            logger.info(f"Ciclo finalizado em {elapsed}s")
+                self._logger.info("Proxies desabilitados (modo direto)")
+
+            # 4. HTTP Client
+            self._http_client = HttpClient(
+                proxy_manager=self._proxy_manager,
+                timeout=settings.http_timeout,
+                max_retries=settings.max_retries,
+                rate_limit_delay=settings.rate_limit_delay,
+            )
+
+            # 5. Promo Engine
+            self._engine = PromoEngine(
+                database=self._db,
+                http_client=self._http_client,
+                cache=self._cache,
+            )
+
+            # 6. Telegram Service
+            self._telegram = TelegramService()
+            bot, dp = self._telegram.initialize(
+                stats_callback=self._get_stats,
+            )
+
+            # Registra handler de force cycle
+            self._register_force_handler(dp)
+
+            self._running = True
+            self._logger.info("Todos os componentes inicializados com sucesso")
+            self._logger.info(f"Destino: {settings.target_chat_id}")
+            self._logger.info(f"Intervalo de coleta: {settings.scrape_interval}s")
+            self._logger.info(
+                f"Scrapers habilitados: {', '.join(settings.enabled_scrapers)}"
+            )
+
+            # Inicia tasks em background
+            asyncio.create_task(self._monitor_loop())
+            asyncio.create_task(self._cache_cleanup_loop())
+            asyncio.create_task(self._db_cleanup_loop())
+            asyncio.create_task(self._watchdog_loop())
+
+            # Notifica admin
+            await self._telegram.send_admin_message(
+                "✅ <b>PromoBot iniciado com sucesso!</b>\n\n"
+                f"🤖 Scrapers: {len(settings.enabled_scrapers)}\n"
+                f"⏱️ Intervalo: {settings.scrape_interval}s\n"
+                f"🎯 Destino: <code>{settings.target_chat_id}</code>"
+            )
+
+            # Inicia polling do Telegram (bloqueante)
+            self._logger.info("Bot iniciado e escutando mensagens...")
+            await dp.start_polling(bot)
+
+        except KeyboardInterrupt:
+            self._logger.info("Encerramento solicitado pelo usuario")
         except Exception as e:
-            logger.error(f"Erro no monitor: {e}")
-        
-        await asyncio.sleep(SCRAPE_INTERVAL)
+            self._logger.critical(f"Erro fatal: {e}", exc_info=True)
+        finally:
+            await self._shutdown()
 
-async def limpar_cache():
-    while True:
-        await asyncio.sleep(3600)
-        recent_links.clear()
+    def _register_force_handler(self, dp) -> None:
+        """Registra handler para forçar ciclo de coleta."""
+        from aiogram import types
+        from aiogram.filters import Command
 
-async def watchdog():
-    while True:
-        logger.info("Bot operando normalmente")
-        await asyncio.sleep(300)
+        @dp.message(Command("force"))
+        async def cmd_force(message: types.Message) -> None:
+            if message.from_user.id != settings.admin_id:
+                return
+            await message.answer("🔄 Forçando ciclo de coleta...")
+            asyncio.create_task(self._run_single_cycle())
 
-# -------------------------
-# INICIALIZAÇÃO PRINCIPAL
-# -------------------------
-async def main():
-    logger.info("Inicializando sistema...")
-    await init_db()
-    
-    asyncio.create_task(monitor())
-    asyncio.create_task(limpar_cache())
-    asyncio.create_task(watchdog())
-    
-    logger.info("Bot iniciado com sucesso e escutando mensagens")
-    await dp.start_polling(bot)
+    async def _monitor_loop(self) -> None:
+        """Loop principal de monitoramento e coleta."""
+        self._logger.info("Monitor de promocoes iniciado")
+
+        # Aguarda um pouco antes do primeiro ciclo
+        await asyncio.sleep(5)
+
+        while self._running:
+            try:
+                await self._run_single_cycle()
+            except Exception as e:
+                self._logger.error(f"Erro no ciclo de monitoramento: {e}", exc_info=True)
+
+            # Aguarda intervalo configurado
+            await asyncio.sleep(settings.scrape_interval)
+
+    async def _run_single_cycle(self) -> None:
+        """Executa um único ciclo de coleta e envio."""
+        start = time.time()
+
+        try:
+            # Coleta e processa promoções
+            products = await self._engine.run_cycle()
+
+            if not products:
+                self._logger.info("Nenhuma nova promocao para enviar")
+                return
+
+            # Envia cada promoção
+            sent_count = 0
+            for product in products:
+                success = await self._telegram.send_promo(product)
+                if success:
+                    await self._engine.register_sent(product)
+                    sent_count += 1
+
+                # Delay entre envios para respeitar rate limit
+                await asyncio.sleep(settings.broadcast_delay)
+
+            elapsed = round(time.time() - start, 2)
+            self._logger.info(
+                f"Ciclo concluido: {sent_count}/{len(products)} promos enviadas "
+                f"em {elapsed}s"
+            )
+
+        except Exception as e:
+            self._logger.error(f"Erro ao executar ciclo: {e}", exc_info=True)
+
+    async def _cache_cleanup_loop(self) -> None:
+        """Limpa entradas expiradas do cache periodicamente."""
+        while self._running:
+            await asyncio.sleep(settings.cache_ttl // 2)
+            try:
+                removed = await self._cache.cleanup_expired()
+                if removed > 0:
+                    self._logger.debug(f"Cache cleanup: {removed} entradas removidas")
+            except Exception as e:
+                self._logger.error(f"Erro no cache cleanup: {e}")
+
+    async def _db_cleanup_loop(self) -> None:
+        """Limpa promoções antigas do banco de dados periodicamente."""
+        while self._running:
+            await asyncio.sleep(86400)  # Uma vez por dia
+            try:
+                deleted = await self._db.cleanup_old_promos(max_age_days=30)
+                if deleted > 0:
+                    self._logger.info(f"DB cleanup: {deleted} promos antigas removidas")
+            except Exception as e:
+                self._logger.error(f"Erro no DB cleanup: {e}")
+
+    async def _watchdog_loop(self) -> None:
+        """Monitora a saúde do sistema periodicamente."""
+        while self._running:
+            await asyncio.sleep(settings.watchdog_interval)
+            try:
+                uptime = round(time.time() - self._start_time)
+                hours = uptime // 3600
+                minutes = (uptime % 3600) // 60
+
+                stats = await self._get_stats()
+                self._logger.info(
+                    f"Watchdog: uptime={hours}h{minutes}m | "
+                    f"ciclos={stats.get('cycles', 0)} | "
+                    f"enviados={stats.get('total_sent', 0)} | "
+                    f"cache={self._cache.size}"
+                )
+            except Exception as e:
+                self._logger.error(f"Erro no watchdog: {e}")
+
+    async def _get_stats(self) -> dict:
+        """Retorna estatísticas completas do sistema."""
+        stats = {}
+        if self._engine:
+            stats.update(self._engine.stats)
+        if self._telegram:
+            stats["telegram"] = self._telegram.stats
+
+        uptime = round(time.time() - self._start_time)
+        stats["uptime_seconds"] = uptime
+        stats["uptime_human"] = f"{uptime // 3600}h {(uptime % 3600) // 60}m"
+
+        return stats
+
+    async def _shutdown(self) -> None:
+        """Encerra graciosamente todos os componentes."""
+        self._logger.info("Encerrando PromoBot...")
+        self._running = False
+
+        if self._telegram:
+            try:
+                await self._telegram.send_admin_message(
+                    "⚠️ <b>PromoBot encerrado.</b>"
+                )
+            except Exception:
+                pass
+            await self._telegram.close()
+
+        if self._db:
+            await self._db.close()
+
+        self._logger.info("PromoBot encerrado com sucesso")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+def main() -> None:
+    """Função principal de entrada."""
+    # Configura logging
+    logger = setup_logging(settings.log_level)
+    logger.info("PromoBot v2.0 - Bot de Promocoes para Telegram")
+
+    # Cria e executa a aplicação
+    app = PromoBot()
+
+    try:
+        asyncio.run(app.start())
+    except KeyboardInterrupt:
+        logger.info("Encerrado pelo usuario")
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
