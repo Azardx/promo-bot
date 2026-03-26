@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+import re
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart, Command
@@ -81,6 +82,31 @@ def montar_texto(titulo):
         f"📦 Promoção encontrada!\n"
     )
 
+# -------------------------
+# IDENTIFICADOR DE CUPONS
+# -------------------------
+def identificar_cupom(titulo: str):
+    """
+    Analisa o título para ver se é um cupom e tenta extrair o código.
+    Retorna o código do cupom, ou None se não for cupom.
+    """
+    t = titulo.upper()
+    if "CUPOM" not in t and "CÓDIGO" not in t:
+        return None
+        
+    # Tenta extrair o código do cupom (ex: KABUM10, CLIENTENOVO, etc)
+    match = re.search(r'(?:CUPOM|CÓDIGO|USE O|CÓD)[\s:]*([A-Z0-9]{4,20})', t)
+    if match:
+        return match.group(1)
+        
+    # Segunda tentativa: busca palavras maiúsculas misturadas com números
+    match_secundario = re.search(r'\b([A-Z]+[0-9]+[A-Z0-9]*)\b', t)
+    if match_secundario:
+         return match_secundario.group(1)
+         
+    # Se sabe que é cupom mas não achou o código exato
+    return "APLICADO NO CARRINHO"
+
 
 # -------------------------
 # COMANDOS
@@ -124,9 +150,8 @@ async def stats(msg: types.Message):
 
 
 # -------------------------
-# PROCESSAMENTO DE PROMO
+# PROCESSAMENTO DE PROMO/CUPOM
 # -------------------------
-
 async def processar_promo(titulo, link):
 
     if not validar_link(link):
@@ -139,15 +164,30 @@ async def processar_promo(titulo, link):
         return
 
     await add_promo(link)
-
     recent_links.add(link)
 
-    texto = montar_texto(titulo)
-    kb = criar_teclado(link)
+    # Ponto Chave: O bot decide se é cupom ou produto
+    codigo_cupom = identificar_cupom(titulo)
+
+    if codigo_cupom:
+        # FORMATO EXCLUSIVO PARA CUPONS (Igual aos bots profissionais)
+        texto = (
+            f"🎟️ <b>CUPOM DE DESCONTO ENCONTRADO!</b>\n\n"
+            f"📝 {titulo}\n\n"
+            f"✂️ Código: <code>{codigo_cupom}</code>\n"
+            f"<i>(Toque no código para copiar ☝️)</i>\n"
+        )
+        kb = types.InlineKeyboardMarkup(
+            inline_keyboard=[[types.InlineKeyboardButton(text="🛒 Resgatar Cupom", url=link)]]
+        )
+        logger.info(f"🎟️ Cupom enviado: {codigo_cupom}")
+    else:
+        # FORMATO PADRÃO PARA PROMOÇÕES
+        texto = montar_texto(titulo)
+        kb = criar_teclado(link)
+        logger.info(f"🔥 Promo enviada: {titulo}")
 
     await broadcast(bot, texto, kb)
-
-    logger.info(f"Promo enviada: {titulo}")
 
 
 # -------------------------
