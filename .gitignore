@@ -16,6 +16,7 @@ env/
 # Configurações locais
 .env
 *.db
+proxies.txt
 
 # Logs
 logs/

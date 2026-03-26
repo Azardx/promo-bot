@@ -4,6 +4,10 @@ Scraper do Promobit via dados SSR (Server-Side Rendering).
 O Promobit usa Next.js e renderiza os dados de ofertas no HTML
 via __NEXT_DATA__. Este scraper extrai esses dados estruturados
 diretamente, sem necessidade de JavaScript ou API separada.
+
+Extrai link real da loja de destino (offerLink/storeUrl) quando
+disponível, para que o bot envie o link direto da loja ao invés
+do link do Promobit.
 """
 
 from __future__ import annotations
@@ -11,6 +15,7 @@ from __future__ import annotations
 import json
 import re
 from typing import Optional
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 from promo_bot.database.models import Product, Store
 from promo_bot.scrapers.base import BaseScraper
@@ -106,13 +111,11 @@ class PromobitScraper(BaseScraper):
     def _extract_next_data(self, html: str) -> Optional[dict]:
         """Extrai e parseia o JSON de __NEXT_DATA__ do HTML."""
         try:
-            # Busca o script __NEXT_DATA__
             pattern = r'<script\s+id="__NEXT_DATA__"\s+type="application/json"[^>]*>(.*?)</script>'
             match = re.search(pattern, html, re.DOTALL)
             if match:
                 return json.loads(match.group(1))
 
-            # Fallback: busca qualquer script com __NEXT_DATA__
             pattern2 = r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>'
             match2 = re.search(pattern2, html, re.DOTALL)
             if match2:
@@ -129,11 +132,17 @@ class PromobitScraper(BaseScraper):
         if not title:
             return None
 
-        # Link da oferta
+        # Link da oferta — prioriza link real da loja de destino
         slug = offer.get("offerSlug", "")
         if not slug:
             return None
-        link = self.OFFER_URL.format(base=self.BASE_URL, slug=slug)
+
+        # Link do Promobit (fallback)
+        promobit_link = self.OFFER_URL.format(base=self.BASE_URL, slug=slug)
+
+        # Tenta obter o link real da loja de destino
+        real_link = self._extract_real_link(offer)
+        link = real_link if real_link else promobit_link
 
         # Preço atual
         price = offer.get("offerPrice")
@@ -203,5 +212,69 @@ class PromobitScraper(BaseScraper):
                 "origin_domain": store_domain,
                 "offer_id": offer.get("offerId"),
                 "likes": offer.get("offerLikes", 0),
+                "promobit_url": promobit_link,
             },
         )
+
+    def _extract_real_link(self, offer: dict) -> Optional[str]:
+        """
+        Extrai o link real da loja de destino da oferta do Promobit.
+
+        O Promobit pode ter o link real em diferentes campos:
+        - offerLink: link direto da loja
+        - offerUrl: URL da oferta na loja
+        - storeUrl: URL da loja
+        """
+        # Campos que podem conter o link real (em ordem de prioridade)
+        link_fields = [
+            "offerLink",
+            "offerUrl",
+            "offerExternalUrl",
+            "storeUrl",
+            "offerAffiliateUrl",
+        ]
+
+        for field_name in link_fields:
+            url = offer.get(field_name, "")
+            if url and isinstance(url, str) and url.startswith("http"):
+                # Verifica se não é um link do próprio Promobit
+                if "promobit.com.br" not in url:
+                    return self._clean_external_url(url)
+
+        # Tenta construir a partir do domínio da loja
+        store_domain = offer.get("storeDomain", "")
+        offer_external_id = offer.get("offerExternalId", "")
+        if store_domain and offer_external_id:
+            # Alguns produtos têm ID externo que pode ser usado
+            return None  # Não temos como construir a URL completa
+
+        return None
+
+    def _clean_external_url(self, url: str) -> str:
+        """Limpa URL externa removendo parâmetros de tracking."""
+        try:
+            parsed = urlparse(url)
+
+            tracking_params = {
+                "utm_source", "utm_medium", "utm_campaign", "utm_content",
+                "utm_term", "ref", "tag", "aff_id", "clickid",
+                "source", "campaign",
+            }
+
+            if parsed.query:
+                params = parse_qs(parsed.query, keep_blank_values=True)
+                cleaned_params = {
+                    k: v for k, v in params.items()
+                    if k.lower() not in tracking_params
+                    and not k.lower().startswith("utm_")
+                }
+                query = urlencode(cleaned_params, doseq=True)
+                url = urlunparse((
+                    parsed.scheme, parsed.netloc, parsed.path,
+                    parsed.params, query, ""
+                ))
+
+            return url
+
+        except Exception:
+            return url

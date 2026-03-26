@@ -3,6 +3,10 @@ Scraper do KaBuM! usando a API pública de catálogo.
 
 Acessa a API REST oficial de catálogo do KaBuM! para coletar
 produtos em oferta com preços, descontos e informações completas.
+
+CORREÇÃO: A URL do produto requer o ID numérico antes do slug:
+  https://www.kabum.com.br/produto/{id}/{slug}
+Sem o ID, a URL retorna 404.
 """
 
 from __future__ import annotations
@@ -24,7 +28,9 @@ class KabumScraper(BaseScraper):
     BASE_URL = "https://servicespub.prod.api.aws.grupokabum.com.br"
 
     CATALOG_URL = "{base}/catalog/v2/products"
-    PRODUCT_URL = "https://www.kabum.com.br/produto/{slug}"
+
+    # URL correta: precisa do ID numérico + slug
+    PRODUCT_URL = "https://www.kabum.com.br/produto/{product_id}/{slug}"
 
     # Headers que a API aceita
     API_HEADERS = {
@@ -113,11 +119,18 @@ class KabumScraper(BaseScraper):
         if not title:
             return None
 
-        # Monta link do produto
+        # ID numérico do produto (nível raiz do item, NÃO dentro de attributes)
+        product_id = item.get("id", "")
+        if not product_id:
+            return None
+
+        # Slug do produto
         product_slug = attrs.get("product_link", "")
         if not product_slug:
             return None
-        link = self.PRODUCT_URL.format(slug=product_slug)
+
+        # Monta link CORRETO: /produto/{id}/{slug}
+        link = self.PRODUCT_URL.format(product_id=product_id, slug=product_slug)
 
         # Preços — prioriza preço de oferta
         offer = attrs.get("offer") or {}
@@ -146,7 +159,7 @@ class KabumScraper(BaseScraper):
         # Frete grátis
         free_shipping = bool(attrs.get("has_free_shipping", False))
 
-        # Cupom (extraído dos stamps)
+        # Cupom — extrai dos stamps E dos filtros da API (highlighted_stamp)
         coupon = self._extract_coupon(attrs.get("stamps", []))
 
         # Categoria
@@ -164,6 +177,10 @@ class KabumScraper(BaseScraper):
             image_url=image_url,
             coupon_code=coupon,
             free_shipping=free_shipping,
+            extra={
+                "kabum_id": product_id,
+                "offer_name": offer.get("name", "") if offer else "",
+            },
         )
 
     def _extract_coupon(self, stamps: list) -> Optional[str]:

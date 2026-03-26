@@ -2,8 +2,9 @@
 Formatador profissional de mensagens do Telegram.
 
 Cria mensagens visualmente atraentes e informativas para cada
-promoção, com suporte a HTML, emojis, preços formatados e
-detecção automática de cupons.
+promoção, com suporte a HTML, emojis, preços formatados,
+detecção automática de cupons e exibição da loja de origem real
+quando a oferta vem de agregadores (Pelando, Promobit).
 """
 
 from __future__ import annotations
@@ -20,11 +21,10 @@ logger = get_logger("formatter")
 
 def _format_brl(value: float) -> str:
     """Formata valor em Reais no padrão brasileiro (R$ 1.499,90)."""
-    # Formata com 2 casas decimais
     formatted = f"{value:,.2f}"
-    # Troca separadores: 1,234.56 -> 1.234,56
     formatted = formatted.replace(",", "X").replace(".", ",").replace("X", ".")
     return f"R$ {formatted}"
+
 
 # Emojis por loja
 STORE_EMOJIS = {
@@ -53,7 +53,8 @@ class MessageFormatter:
     Formatador de mensagens para o Telegram.
 
     Cria mensagens em HTML com formatação profissional,
-    incluindo título, preço, desconto, cupom e link.
+    incluindo título, preço, desconto, cupom, link e
+    loja de origem real quando disponível.
     """
 
     def format_product(self, product: Product) -> str:
@@ -78,10 +79,53 @@ class MessageFormatter:
         else:
             return self._format_simple_deal(product)
 
-    def _format_discount_deal(self, product: Product) -> str:
-        """Formata uma oferta com desconto visível."""
+    def _get_store_display(self, product: Product) -> tuple[str, str]:
+        """
+        Retorna emoji e nome da loja para exibição.
+
+        Para ofertas de agregadores (Pelando, Promobit), mostra a
+        loja de origem real quando disponível.
+
+        Returns:
+            Tupla (emoji, nome_da_loja).
+        """
         store_emoji = STORE_EMOJIS.get(product.store, "🏷️")
         store_name = STORE_NAMES.get(product.store, "Loja")
+
+        # Para Pelando e Promobit, mostra a loja de origem real
+        origin_store = product.extra.get("origin_store", "")
+        if origin_store and product.store in (Store.PELANDO, Store.PROMOBIT):
+            store_name = origin_store
+            # Tenta mapear emoji da loja de origem
+            origin_lower = origin_store.lower()
+            if "amazon" in origin_lower:
+                store_emoji = "📦"
+            elif "shopee" in origin_lower:
+                store_emoji = "🟠"
+            elif "aliexpress" in origin_lower or "ali express" in origin_lower:
+                store_emoji = "🔴"
+            elif "kabum" in origin_lower:
+                store_emoji = "🟢"
+            elif "mercado livre" in origin_lower or "mercadolivre" in origin_lower:
+                store_emoji = "🛒"
+            elif "magalu" in origin_lower or "magazine luiza" in origin_lower:
+                store_emoji = "🔵"
+            elif "casas bahia" in origin_lower:
+                store_emoji = "🏠"
+            elif "carrefour" in origin_lower:
+                store_emoji = "🛒"
+            elif "samsung" in origin_lower:
+                store_emoji = "📱"
+            elif "nike" in origin_lower:
+                store_emoji = "👟"
+            else:
+                store_emoji = "🏪"
+
+        return store_emoji, store_name
+
+    def _format_discount_deal(self, product: Product) -> str:
+        """Formata uma oferta com desconto visível."""
+        store_emoji, store_name = self._get_store_display(product)
         title = escape(self._truncate(product.title, 200))
 
         lines = [
@@ -115,8 +159,12 @@ class MessageFormatter:
         if product.free_shipping:
             lines.append("🚚 <b>Frete Grátis</b>")
 
+        # Cupom (se houver)
+        if product.coupon_code:
+            lines.append(f"✂️ Cupom: <code>{escape(product.coupon_code)}</code>")
+
         # Loja
-        lines.append(f"{store_emoji} Loja: <b>{store_name}</b>")
+        lines.append(f"{store_emoji} Loja: <b>{escape(store_name)}</b>")
         lines.append("")
         lines.append("🔗 <b>Acesse a oferta abaixo:</b>")
 
@@ -124,8 +172,7 @@ class MessageFormatter:
 
     def _format_price_deal(self, product: Product) -> str:
         """Formata uma oferta com preço (sem desconto calculável)."""
-        store_emoji = STORE_EMOJIS.get(product.store, "🏷️")
-        store_name = STORE_NAMES.get(product.store, "Loja")
+        store_emoji, store_name = self._get_store_display(product)
         title = escape(self._truncate(product.title, 200))
 
         lines = [
@@ -142,8 +189,12 @@ class MessageFormatter:
         if product.free_shipping:
             lines.append("🚚 <b>Frete Grátis</b>")
 
+        # Cupom (se houver)
+        if product.coupon_code:
+            lines.append(f"✂️ Cupom: <code>{escape(product.coupon_code)}</code>")
+
         lines.append("")
-        lines.append(f"{store_emoji} Loja: <b>{store_name}</b>")
+        lines.append(f"{store_emoji} Loja: <b>{escape(store_name)}</b>")
         lines.append("")
         lines.append("🔗 <b>Confira no link abaixo:</b>")
 
@@ -151,8 +202,7 @@ class MessageFormatter:
 
     def _format_coupon_deal(self, product: Product, coupon: str) -> str:
         """Formata uma oferta com cupom de desconto."""
-        store_emoji = STORE_EMOJIS.get(product.store, "🏷️")
-        store_name = STORE_NAMES.get(product.store, "Loja")
+        store_emoji, store_name = self._get_store_display(product)
         title = escape(self._truncate(product.title, 200))
 
         lines = [
@@ -178,7 +228,7 @@ class MessageFormatter:
         if product.free_shipping:
             lines.append("🚚 <b>Frete Grátis</b>")
 
-        lines.append(f"{store_emoji} Loja: <b>{store_name}</b>")
+        lines.append(f"{store_emoji} Loja: <b>{escape(store_name)}</b>")
         lines.append("")
         lines.append("🔗 <b>Resgate o cupom abaixo:</b>")
 
@@ -186,8 +236,7 @@ class MessageFormatter:
 
     def _format_simple_deal(self, product: Product) -> str:
         """Formata uma oferta simples (sem preço definido)."""
-        store_emoji = STORE_EMOJIS.get(product.store, "🏷️")
-        store_name = STORE_NAMES.get(product.store, "Loja")
+        store_emoji, store_name = self._get_store_display(product)
         title = escape(self._truncate(product.title, 200))
 
         lines = [
@@ -203,7 +252,11 @@ class MessageFormatter:
         if product.free_shipping:
             lines.append("🚚 <b>Frete Grátis</b>")
 
-        lines.append(f"{store_emoji} Loja: <b>{store_name}</b>")
+        # Cupom (se houver)
+        if product.coupon_code:
+            lines.append(f"✂️ Cupom: <code>{escape(product.coupon_code)}</code>")
+
+        lines.append(f"{store_emoji} Loja: <b>{escape(store_name)}</b>")
         lines.append("")
         lines.append("🔗 <b>Confira no link abaixo:</b>")
 
@@ -288,6 +341,17 @@ class MessageFormatter:
                 f"  Requisições: {http.get('total_requests', 0)}",
                 f"  Erros: {http.get('total_errors', 0)}",
                 f"  Taxa de erro: {http.get('error_rate', '0%')}",
+            ])
+
+        # Telegram stats
+        telegram = stats.get("telegram", {})
+        if telegram:
+            lines.extend([
+                "",
+                "<b>Telegram:</b>",
+                f"  Mensagens: {telegram.get('messages_sent', 0)}",
+                f"  Fotos: {telegram.get('photos_sent', 0)}",
+                f"  Erros: {telegram.get('errors', 0)}",
             ])
 
         return "\n".join(lines)
