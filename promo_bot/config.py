@@ -111,7 +111,7 @@ class Settings:
     enabled_scrapers: list[str] = field(
         default_factory=lambda: _get_list(
             "ENABLED_SCRAPERS",
-            "shopee,aliexpress,amazon,pelando,promobit,kabum"
+            "shopee,aliexpress,amazon,pelando,promobit,kabum,terabyte,mercadolivre"
         )
     )
 

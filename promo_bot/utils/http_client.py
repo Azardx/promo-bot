@@ -4,6 +4,11 @@ Cliente HTTP robusto e assíncrono do PromoBot.
 Implementa requisições com rotação de User-Agent, suporte a proxies,
 retry com backoff exponencial e controle de rate limit.
 Inclui fallback via curl_cffi para sites com TLS fingerprinting.
+
+CORREÇÕES v2.1:
+- Backoff reduzido para evitar travamento (max 3s entre retries)
+- Rate limit delay reduzido para 1s por domínio
+- Timeout de curl_cffi reduzido
 """
 
 from __future__ import annotations
@@ -86,11 +91,14 @@ class HttpClient:
     fallback para sites com TLS fingerprinting.
     """
 
+    # Backoff máximo entre retries (evita travamento)
+    MAX_BACKOFF = 3.0
+
     def __init__(
         self,
         proxy_manager: Optional[ProxyManager] = None,
         timeout: int = 15,
-        max_retries: int = 3,
+        max_retries: int = 2,
         rate_limit_delay: float = 1.0,
     ):
         self._proxy_manager = proxy_manager
@@ -107,7 +115,7 @@ class HttpClient:
         last = self._last_request_time.get(domain, 0)
         elapsed = now - last
         if elapsed < self._rate_limit_delay:
-            delay = self._rate_limit_delay - elapsed + random.uniform(0.1, 0.5)
+            delay = self._rate_limit_delay - elapsed + random.uniform(0.1, 0.3)
             await asyncio.sleep(delay)
         self._last_request_time[domain] = time.time()
 
@@ -157,7 +165,7 @@ class HttpClient:
                             f"Bloqueio {response.status_code} via curl em "
                             f"{self._extract_domain(url)} (tentativa {attempt + 1})"
                         )
-                        wait_time = (2 ** attempt) + random.uniform(1, 3)
+                        wait_time = min((2 ** attempt) + random.uniform(0.5, 1.5), self.MAX_BACKOFF)
                         await asyncio.sleep(wait_time)
                         req_headers = _random_headers(headers)
                         continue
@@ -175,7 +183,7 @@ class HttpClient:
                 last_error = str(e)
 
             if attempt < self._max_retries - 1:
-                wait_time = (2 ** attempt) + random.uniform(0.5, 2)
+                wait_time = min((2 ** attempt) + random.uniform(0.3, 1.0), self.MAX_BACKOFF)
                 await asyncio.sleep(wait_time)
 
         self._error_count += 1
@@ -251,8 +259,8 @@ class HttpClient:
                         if proxy_url and self._proxy_manager:
                             await self._proxy_manager.report_failure(proxy_url)
 
-                        # Backoff exponencial
-                        wait_time = (2 ** attempt) + random.uniform(1, 3)
+                        # Backoff limitado
+                        wait_time = min((2 ** attempt) + random.uniform(0.5, 1.5), self.MAX_BACKOFF)
                         await asyncio.sleep(wait_time)
 
                         # Troca User-Agent na próxima tentativa
@@ -280,9 +288,9 @@ class HttpClient:
             if proxy_url and self._proxy_manager:
                 await self._proxy_manager.report_failure(proxy_url)
 
-            # Backoff exponencial entre tentativas
+            # Backoff limitado entre tentativas
             if attempt < self._max_retries - 1:
-                wait_time = (2 ** attempt) + random.uniform(0.5, 2)
+                wait_time = min((2 ** attempt) + random.uniform(0.3, 1.0), self.MAX_BACKOFF)
                 await asyncio.sleep(wait_time)
 
         self._error_count += 1

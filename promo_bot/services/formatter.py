@@ -34,6 +34,8 @@ STORE_EMOJIS = {
     Store.KABUM: "🟢",
     Store.PELANDO: "🔥",
     Store.PROMOBIT: "💎",
+    Store.TERABYTE: "💻",
+    Store.MERCADOLIVRE: "🛒",
     Store.UNKNOWN: "🏷️",
 }
 
@@ -44,6 +46,8 @@ STORE_NAMES = {
     Store.KABUM: "KaBuM!",
     Store.PELANDO: "Pelando",
     Store.PROMOBIT: "Promobit",
+    Store.TERABYTE: "Terabyte Shop",
+    Store.MERCADOLIVRE: "Mercado Livre",
     Store.UNKNOWN: "Loja",
 }
 

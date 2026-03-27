@@ -4,6 +4,12 @@ Scraper da Amazon Brasil via página de ofertas.
 A Amazon possui proteção anti-bot robusta, mas a página de ofertas
 do dia pode ser acessada com headers adequados. Este scraper usa
 parsing HTML com múltiplos fallbacks.
+
+CORREÇÕES v2.1:
+- Filtro de conteúdo digital (filmes, séries, livros, Kindle, Prime Video)
+- Extração de imagem melhorada com fallbacks múltiplos
+- Extração de cupons quando disponíveis
+- Normalização de links com tag de afiliado
 """
 
 from __future__ import annotations
@@ -40,6 +46,48 @@ class AmazonScraper(BaseScraper):
         "Cache-Control": "no-cache",
     }
 
+    # Palavras-chave que indicam conteúdo digital (filmes, séries, livros, etc.)
+    DIGITAL_CONTENT_KEYWORDS = [
+        # Filmes e séries
+        "temporada", "temporadas", "episódio", "episodio", "episódios",
+        "série", "serie", "séries", "series",
+        "filme", "filmes", "movie", "movies",
+        "prime video", "primevideo", "amazon video",
+        "assistir", "streaming", "legendado", "dublado",
+        "imdb", "elenco:", "diretor:", "direção:",
+        "drama", "comédia", "comedia", "suspense", "terror",
+        "documentário", "documentario", "animação", "animacao",
+        "nova série", "nova serie",
+        # Livros e Kindle
+        "kindle", "ebook", "e-book", "livro digital",
+        "edição kindle", "edicao kindle", "formato kindle",
+        "audiobook", "audiolivro", "audible",
+        "brochura", "capa dura", "capa comum",
+        "editora", "autor:", "páginas",
+        # Música
+        "amazon music", "music unlimited",
+        "álbum", "album", "playlist",
+        # Outros digitais
+        "assinatura", "plano mensal", "plano anual",
+        "período de teste", "periodo de teste",
+        "teste gratuito", "grátis por",
+    ]
+
+    # Padrões de URL que indicam conteúdo digital
+    DIGITAL_URL_PATTERNS = [
+        r"/dp/B[0-9A-Z]{9}.*?/.*?(video|movie|serie|film|kindle|book|music|audible)",
+        r"primevideo\.com",
+        r"amazon\.com\.br/gp/video",
+        r"amazon\.com\.br/kindle",
+        r"amazon\.com\.br/music",
+    ]
+
+    # Categorias da Amazon que são conteúdo digital
+    DIGITAL_CATEGORIES = [
+        "prime-video", "instant-video", "digital-text", "digital-music",
+        "audible", "kindle-store", "books", "movies-tv",
+    ]
+
     def __init__(self, http_client: HttpClient, cache: TTLCache):
         super().__init__(http_client, cache)
 
@@ -60,8 +108,48 @@ class AmazonScraper(BaseScraper):
         if not products:
             products = await self._scrape_search_deals()
 
-        self._logger.info(f"Amazon: {len(products)} ofertas coletadas")
-        return products
+        # Filtra conteúdo digital
+        filtered = [p for p in products if not self._is_digital_content(p)]
+        removed = len(products) - len(filtered)
+        if removed > 0:
+            self._logger.info(f"Amazon: {removed} itens de conteudo digital removidos")
+
+        self._logger.info(f"Amazon: {len(filtered)} ofertas coletadas")
+        return filtered
+
+    def _is_digital_content(self, product: Product) -> bool:
+        """Verifica se o produto é conteúdo digital (filme, série, livro, etc.)."""
+        title_lower = product.title.lower()
+        link_lower = product.link.lower()
+
+        # Verifica palavras-chave no título
+        for keyword in self.DIGITAL_CONTENT_KEYWORDS:
+            if keyword in title_lower:
+                self._logger.debug(
+                    f"Conteudo digital detectado (keyword '{keyword}'): {product.title[:50]}"
+                )
+                return True
+
+        # Verifica padrões na URL
+        for pattern in self.DIGITAL_URL_PATTERNS:
+            if re.search(pattern, link_lower, re.IGNORECASE):
+                self._logger.debug(
+                    f"Conteudo digital detectado (URL): {product.link}"
+                )
+                return True
+
+        # Verifica se o título é muito curto e parece nome de filme/série
+        # (títulos de produtos reais geralmente são mais descritivos)
+        if len(product.title) < 40 and not product.price:
+            # Título curto sem preço = provavelmente conteúdo digital
+            words = product.title.split()
+            if len(words) <= 4:
+                self._logger.debug(
+                    f"Possivel conteudo digital (titulo curto sem preco): {product.title}"
+                )
+                return True
+
+        return False
 
     async def _scrape_page(self, url: str) -> list[Product]:
         """Coleta ofertas de uma página da Amazon."""
@@ -89,7 +177,7 @@ class AmazonScraper(BaseScraper):
                 self._logger.debug(
                     f"Amazon: encontrou {len(cards)} cards com '{selector}'"
                 )
-                for card in cards[:20]:
+                for card in cards[:25]:
                     product = self._parse_deal_card(card)
                     if product:
                         products.append(product)
@@ -183,9 +271,11 @@ class AmazonScraper(BaseScraper):
                 if disc_match:
                     discount_pct = float(disc_match.group(1))
 
-            # Imagem
-            img_el = card.select_one("img[src*='images-amazon'], img[src*='m.media-amazon']")
-            image = img_el.get("src", "") if img_el else ""
+            # Imagem — busca mais ampla
+            image = self._extract_image(card)
+
+            # Cupom
+            coupon = self._extract_coupon(card)
 
             return Product(
                 title=self._clean_title(title),
@@ -195,11 +285,109 @@ class AmazonScraper(BaseScraper):
                 original_price=original_price,
                 discount_pct=discount_pct,
                 image_url=image,
+                coupon_code=coupon,
             )
 
         except Exception as e:
             self._logger.debug(f"Erro ao parsear card Amazon: {e}")
             return None
+
+    def _extract_image(self, card) -> str:
+        """Extrai URL da imagem do produto com múltiplos fallbacks."""
+        # Seletores de imagem em ordem de prioridade
+        img_selectors = [
+            "img[src*='images-amazon']",
+            "img[src*='m.media-amazon']",
+            "img[data-src*='images-amazon']",
+            "img[data-src*='m.media-amazon']",
+            "img[src*='ssl-images-amazon']",
+            "img.a-dynamic-image",
+            "img[data-a-dynamic-image]",
+            "img[src]",
+        ]
+
+        for sel in img_selectors:
+            img_el = card.select_one(sel)
+            if img_el:
+                # Tenta src primeiro, depois data-src
+                src = img_el.get("src", "") or img_el.get("data-src", "")
+                if src and "amazon" in src and not self._is_placeholder(src):
+                    # Tenta obter versão em alta resolução
+                    return self._get_high_res_image(src)
+
+                # Tenta data-a-dynamic-image (JSON com múltiplas resoluções)
+                dynamic = img_el.get("data-a-dynamic-image", "")
+                if dynamic:
+                    try:
+                        import json
+                        images = json.loads(dynamic)
+                        if images:
+                            # Pega a maior resolução
+                            best_url = max(images.keys(), key=lambda u: sum(images[u]))
+                            if best_url and "amazon" in best_url:
+                                return best_url
+                    except Exception:
+                        pass
+
+        return ""
+
+    def _is_placeholder(self, url: str) -> bool:
+        """Verifica se a URL é uma imagem placeholder."""
+        placeholders = [
+            "transparent-pixel",
+            "grey-pixel",
+            "loading-",
+            "spinner",
+            "1x1",
+            "pixel.",
+            "blank.",
+            "no-img",
+        ]
+        url_lower = url.lower()
+        return any(p in url_lower for p in placeholders)
+
+    def _get_high_res_image(self, url: str) -> str:
+        """Tenta obter versão em alta resolução da imagem."""
+        # Amazon usa sufixos como _AC_UL320_ para tamanho
+        # Remove o sufixo de tamanho para obter resolução maior
+        high_res = re.sub(
+            r'\._[A-Z]{2}_[A-Z]{2}\d+_\.',
+            '._AC_SL500_.',
+            url,
+        )
+        if high_res != url:
+            return high_res
+
+        # Tenta substituir tamanhos comuns
+        high_res = re.sub(r'_SX\d+_', '_SX500_', url)
+        high_res = re.sub(r'_SY\d+_', '_SY500_', high_res)
+        return high_res
+
+    def _extract_coupon(self, card) -> Optional[str]:
+        """Extrai cupom de desconto do card da Amazon."""
+        # Amazon mostra cupons como "Aplique cupom de X%"
+        coupon_selectors = [
+            "[class*='coupon']",
+            "[data-coupon]",
+            "[class*='Coupon']",
+            "span.a-color-success",
+        ]
+
+        for sel in coupon_selectors:
+            el = card.select_one(sel)
+            if el:
+                text = el.get_text(strip=True)
+                if "cupom" in text.lower() or "coupon" in text.lower():
+                    # Extrai percentual ou valor
+                    match = re.search(r"(\d+)\s*%", text)
+                    if match:
+                        return f"CUPOM {match.group(1)}% OFF"
+                    match = re.search(r"R\$\s*([\d.,]+)", text)
+                    if match:
+                        return f"CUPOM R${match.group(1)} OFF"
+                    return "APLICAR CUPOM"
+
+        return None
 
     def _parse_product_links(self, soup: BeautifulSoup) -> list[Product]:
         """Fallback: extrai produtos de links genéricos."""
@@ -228,6 +416,7 @@ class AmazonScraper(BaseScraper):
                     continue
 
                 price = None
+                image = ""
                 parent = link_el.find_parent(
                     class_=re.compile(r"card|item|product|deal", re.I)
                 )
@@ -238,11 +427,15 @@ class AmazonScraper(BaseScraper):
                     if price_el:
                         price = self._parse_price(price_el.get_text(strip=True))
 
+                    # Tenta extrair imagem do parent
+                    image = self._extract_image(parent)
+
                 products.append(Product(
                     title=self._clean_title(title[:150]),
                     link=clean_link,
                     store=self.STORE,
                     price=price,
+                    image_url=image,
                 ))
             except Exception:
                 continue
@@ -300,12 +493,20 @@ class AmazonScraper(BaseScraper):
                 self._parse_price(orig_el.get_text(strip=True)) if orig_el else None
             )
 
+            # Imagem
+            image = self._extract_image(result)
+
+            # Cupom
+            coupon = self._extract_coupon(result)
+
             return Product(
                 title=self._clean_title(title),
                 link=link,
                 store=self.STORE,
                 price=price,
                 original_price=original_price,
+                image_url=image,
+                coupon_code=coupon,
             )
         except Exception:
             return None

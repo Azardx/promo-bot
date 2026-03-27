@@ -26,6 +26,8 @@ def _register_scrapers() -> None:
     from promo_bot.scrapers.pelando import PelandoScraper
     from promo_bot.scrapers.promobit import PromobitScraper
     from promo_bot.scrapers.kabum import KabumScraper
+    from promo_bot.scrapers.terabyte import TerabyteScraper
+    from promo_bot.scrapers.mercadolivre import MercadoLivreScraper
 
     SCRAPER_REGISTRY.update({
         "shopee": ShopeeScraper,
@@ -34,6 +36,8 @@ def _register_scrapers() -> None:
         "pelando": PelandoScraper,
         "promobit": PromobitScraper,
         "kabum": KabumScraper,
+        "terabyte": TerabyteScraper,
+        "mercadolivre": MercadoLivreScraper,
     })
 
 

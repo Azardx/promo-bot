@@ -3,6 +3,10 @@ Motor de promoções (Promo Engine) do PromoBot.
 
 Orquestra todo o pipeline de coleta, filtragem, deduplicação,
 scoring e envio de promoções. É o cérebro do sistema.
+
+CORREÇÕES v2.1:
+- Timeout individual por scraper para evitar travamento
+- Coleta concorrente com proteção contra scrapers lentos
 """
 
 from __future__ import annotations
@@ -24,6 +28,9 @@ from promo_bot.utils.http_client import HttpClient
 from promo_bot.utils.logger import get_logger
 
 logger = get_logger("engine")
+
+# Timeout máximo por scraper individual (segundos)
+SCRAPER_TIMEOUT = 45
 
 
 class PromoEngine:
@@ -76,7 +83,7 @@ class PromoEngine:
         self._cycle_count += 1
         logger.info(f"=== Ciclo #{self._cycle_count} iniciado ===")
 
-        # 1. Coleta de todas as fontes (concorrente)
+        # 1. Coleta de todas as fontes (concorrente com timeout)
         all_products = await self._collect_all()
         self._total_collected += len(all_products)
         logger.info(f"Coleta total: {len(all_products)} produtos brutos")
@@ -114,23 +121,37 @@ class PromoEngine:
         return final
 
     async def _collect_all(self) -> list[Product]:
-        """Executa todos os scrapers de forma concorrente."""
+        """Executa todos os scrapers de forma concorrente com timeout individual."""
         all_products: list[Product] = []
 
-        # Cria tasks para todos os scrapers
-        tasks = [scraper.run() for scraper in self._scrapers]
+        # Cria tasks com timeout individual para cada scraper
+        async def _run_scraper_with_timeout(scraper: BaseScraper) -> tuple[BaseScraper, ScraperResult | Exception]:
+            try:
+                result = await asyncio.wait_for(
+                    scraper.run(),
+                    timeout=SCRAPER_TIMEOUT,
+                )
+                return scraper, result
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"Scraper {scraper.NAME} excedeu timeout de {SCRAPER_TIMEOUT}s"
+                )
+                return scraper, TimeoutError(f"Timeout após {SCRAPER_TIMEOUT}s")
+            except Exception as e:
+                return scraper, e
 
-        # Executa com timeout individual
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Executa todos os scrapers concorrentemente
+        tasks = [_run_scraper_with_timeout(s) for s in self._scrapers]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
 
-        for scraper, result in zip(self._scrapers, results):
+        for scraper, result in results:
             if isinstance(result, Exception):
                 logger.error(f"Scraper {scraper.NAME} falhou com excecao: {result}")
                 await self._db.log_scraper_run(
                     scraper_name=scraper.NAME,
                     duration_secs=0,
                     errors=1,
-                    status="exception",
+                    status="exception" if not isinstance(result, TimeoutError) else "timeout",
                 )
                 continue
 

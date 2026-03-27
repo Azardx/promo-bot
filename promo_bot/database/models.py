@@ -20,6 +20,8 @@ class Store(str, Enum):
     KABUM = "kabum"
     PELANDO = "pelando"
     PROMOBIT = "promobit"
+    TERABYTE = "terabyte"
+    MERCADOLIVRE = "mercadolivre"
     UNKNOWN = "unknown"
 
 
