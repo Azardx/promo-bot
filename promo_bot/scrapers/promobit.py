@@ -1,13 +1,14 @@
 """
-Scraper do Promobit via dados SSR (Server-Side Rendering).
+Scraper do Promobit via dados SSR (Server-Side Rendering) e HTML fallback.
 
-O Promobit usa Next.js e renderiza os dados de ofertas no HTML
-via __NEXT_DATA__. Este scraper extrai esses dados estruturados
-diretamente, sem necessidade de JavaScript ou API separada.
+O Promobit usa Next.js e renderiza os dados de ofertas no HTML via __NEXT_DATA__. 
+Este scraper extrai esses dados estruturados diretamente e possui fallback 
+para parsing HTML caso a estrutura do Next.js mude.
 
-Extrai link real da loja de destino (offerLink/storeUrl) quando
-disponível, para que o bot envie o link direto da loja ao invés
-do link do Promobit.
+CORREÇÕES v2.3:
+- Suporte a múltiplas estruturas de __NEXT_DATA__
+- Fallback para parsing HTML direto
+- Extração aprimorada de cupons e loja de origem
 """
 
 from __future__ import annotations
@@ -17,6 +18,8 @@ import re
 from typing import Optional
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
+from bs4 import BeautifulSoup
+
 from promo_bot.database.models import Product, Store
 from promo_bot.scrapers.base import BaseScraper
 from promo_bot.utils.cache import TTLCache
@@ -24,7 +27,7 @@ from promo_bot.utils.http_client import HttpClient
 
 
 class PromobitScraper(BaseScraper):
-    """Scraper do Promobit via __NEXT_DATA__ (SSR)."""
+    """Scraper do Promobit com suporte a SSR e HTML."""
 
     STORE = Store.PROMOBIT
     NAME = "promobit"
@@ -42,9 +45,9 @@ class PromobitScraper(BaseScraper):
         super().__init__(http_client, cache)
 
     async def _scrape(self) -> list[Product]:
-        """Coleta ofertas do Promobit via SSR data."""
+        """Coleta ofertas do Promobit."""
         products: list[Product] = []
-        seen_ids: set[int] = set()
+        seen_ids: set[str] = set()
 
         for page_path in self.PAGES:
             url = f"{self.BASE_URL}{page_path}"
@@ -54,7 +57,7 @@ class PromobitScraper(BaseScraper):
         self._logger.info(f"Promobit: {len(products)} ofertas coletadas no total")
         return products
 
-    async def _scrape_page(self, url: str, seen_ids: set[int]) -> list[Product]:
+    async def _scrape_page(self, url: str, seen_ids: set[str]) -> list[Product]:
         """Extrai ofertas de uma página do Promobit."""
         products: list[Product] = []
 
@@ -63,218 +66,189 @@ class PromobitScraper(BaseScraper):
             self._logger.warning(f"Falha ao acessar {url}")
             return products
 
-        # Extrai __NEXT_DATA__ do HTML
+        # 1. Tenta extrair via __NEXT_DATA__
         next_data = self._extract_next_data(html)
-        if not next_data:
-            self._logger.warning(f"__NEXT_DATA__ nao encontrado em {url}")
-            return products
-
-        # Navega até as ofertas
-        try:
-            page_props = next_data.get("props", {}).get("pageProps", {})
-            server_offers = page_props.get("serverOffers", {})
-
-            # serverOffers pode ser dict com chave "offers" ou lista direta
-            if isinstance(server_offers, dict):
-                offers = server_offers.get("offers", [])
-            elif isinstance(server_offers, list):
-                offers = server_offers
-            else:
-                offers = []
-
-            # Também tenta serverFeaturedOffers
-            featured = page_props.get("serverFeaturedOffers", [])
-            if isinstance(featured, list):
-                offers = featured + offers
-
-        except (AttributeError, TypeError) as e:
-            self._logger.warning(f"Erro ao navegar dados do Promobit: {e}")
-            return products
-
-        self._logger.debug(f"Promobit: {len(offers)} ofertas encontradas em {url}")
-
-        for offer in offers:
+        if next_data:
             try:
-                offer_id = offer.get("offerId", 0)
-                if offer_id in seen_ids:
-                    continue
-                seen_ids.add(offer_id)
+                offers = self._extract_offers_from_next(next_data)
+                for offer in offers:
+                    offer_id = str(offer.get("offerId") or offer.get("id", ""))
+                    if not offer_id or offer_id in seen_ids:
+                        continue
+                    seen_ids.add(offer_id)
 
-                product = self._parse_offer(offer)
-                if product:
-                    products.append(product)
+                    product = self._parse_next_offer(offer)
+                    if product:
+                        products.append(product)
+                
+                if products:
+                    self._logger.debug(f"Promobit: {len(products)} ofertas via NEXT_DATA em {url}")
+                    return products
             except Exception as e:
-                self._logger.debug(f"Erro ao parsear oferta Promobit: {e}")
+                self._logger.debug(f"Erro ao processar NEXT_DATA Promobit: {e}")
+
+        # 2. Fallback: Parsing HTML direto
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            cards = soup.select("div[class*='OfferCard'], article[class*='OfferCard'], .offer-card")
+            
+            for card in cards[:30]:
+                product = self._parse_html_card(card)
+                if product:
+                    # Usa link como ID para deduplicação simples aqui
+                    if product.link not in seen_ids:
+                        seen_ids.add(product.link)
+                        products.append(product)
+            
+            if products:
+                self._logger.debug(f"Promobit: {len(products)} ofertas via HTML em {url}")
+        except Exception as e:
+            self._logger.error(f"Erro no fallback HTML Promobit: {e}")
 
         return products
 
     def _extract_next_data(self, html: str) -> Optional[dict]:
-        """Extrai e parseia o JSON de __NEXT_DATA__ do HTML."""
+        """Extrai o JSON de __NEXT_DATA__ do HTML."""
         try:
-            pattern = r'<script\s+id="__NEXT_DATA__"\s+type="application/json"[^>]*>(.*?)</script>'
+            pattern = r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>'
             match = re.search(pattern, html, re.DOTALL)
             if match:
                 return json.loads(match.group(1))
-
-            pattern2 = r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>'
-            match2 = re.search(pattern2, html, re.DOTALL)
-            if match2:
-                return json.loads(match2.group(1))
-
-        except (json.JSONDecodeError, TypeError) as e:
-            self._logger.warning(f"Erro ao parsear __NEXT_DATA__: {e}")
-
+        except Exception:
+            pass
         return None
 
-    def _parse_offer(self, offer: dict) -> Optional[Product]:
-        """Converte uma oferta do Promobit em Product."""
-        title = offer.get("offerTitle", "").strip()
-        if not title:
-            return None
+    def _extract_offers_from_next(self, data: dict) -> list[dict]:
+        """Navega pelo JSON do Next.js para encontrar a lista de ofertas."""
+        try:
+            props = data.get("props", {}).get("pageProps", {})
+            
+            # Caminho 1: serverOffers
+            server_offers = props.get("serverOffers", {})
+            if isinstance(server_offers, dict):
+                offers = server_offers.get("offers", [])
+                if offers: return offers
+            elif isinstance(server_offers, list):
+                return server_offers
 
-        # Link da oferta — prioriza link real da loja de destino
-        slug = offer.get("offerSlug", "")
-        if not slug:
-            return None
+            # Caminho 2: serverFeaturedOffers
+            featured = props.get("serverFeaturedOffers", [])
+            if featured: return featured
 
-        # Link do Promobit (fallback)
-        promobit_link = self.OFFER_URL.format(base=self.BASE_URL, slug=slug)
+            # Caminho 3: initialState
+            initial = data.get("props", {}).get("initialState", {})
+            offers_list = initial.get("offers", {}).get("list", [])
+            if offers_list: return offers_list
 
-        # Tenta obter o link real da loja de destino
-        real_link = self._extract_real_link(offer)
-        link = real_link if real_link else promobit_link
+        except Exception:
+            pass
+        return []
 
-        # Preço atual
-        price = offer.get("offerPrice")
-        if price is not None:
-            try:
-                price = float(price) if float(price) > 0 else None
-            except (ValueError, TypeError):
-                price = None
+    def _parse_next_offer(self, offer: dict) -> Optional[Product]:
+        """Converte uma oferta do JSON Next.js em Product."""
+        try:
+            title = offer.get("offerTitle") or offer.get("title") or offer.get("name")
+            if not title: return None
 
-        # Preço original
-        original_price = offer.get("offerOldPrice")
-        if original_price is not None:
-            try:
-                original_price = float(original_price) if float(original_price) > 0 else None
-            except (ValueError, TypeError):
-                original_price = None
-        if price and original_price and original_price <= price:
-            original_price = None
+            slug = offer.get("offerSlug") or offer.get("slug")
+            id_ = offer.get("offerId") or offer.get("id")
+            promobit_link = f"{self.BASE_URL}/oferta/{slug}-{id_}/" if slug and id_ else None
+            
+            # Tenta link real da loja
+            real_link = self._extract_real_link(offer)
+            link = real_link or promobit_link or offer.get("url")
+            if not link: return None
 
-        # Desconto
-        discount_pct = offer.get("offerDiscontPercentage")  # Sim, é "Discont" na API
-        if discount_pct is not None:
-            try:
-                discount_pct = float(discount_pct) if float(discount_pct) > 0 else None
-            except (ValueError, TypeError):
-                discount_pct = None
-
-        # Cupom
-        coupon = offer.get("offerCoupon")
-        if coupon:
-            coupon = str(coupon).strip() or None
-        else:
-            coupon = None
-
-        # Imagem
-        image_url = ""
-        photo = offer.get("offerPhoto", "")
-        if photo:
-            if photo.startswith("http"):
+            price = float(offer.get("offerPrice") or offer.get("price", 0)) or None
+            original_price = float(offer.get("offerOldPrice") or offer.get("oldPrice", 0)) or None
+            
+            # Cupom
+            coupon = offer.get("offerCoupon") or offer.get("couponCode") or offer.get("coupon")
+            if isinstance(coupon, dict):
+                coupon = coupon.get("code")
+            
+            # Imagem
+            image_url = ""
+            photo = offer.get("offerPhoto") or offer.get("image")
+            if isinstance(photo, dict):
+                image_url = photo.get("url") or photo.get("src", "")
+            elif isinstance(photo, str):
                 image_url = photo
-            elif photo.startswith("/"):
-                image_url = f"https://www.promobit.com.br{photo}"
+            
+            if image_url and image_url.startswith("/"):
+                image_url = f"{self.BASE_URL}{image_url}"
 
-        # Loja de origem
-        store_name = offer.get("storeName", "")
-        store_domain = offer.get("storeDomain", "")
+            # Loja de origem
+            store_name = offer.get("storeName") or offer.get("retailer", {}).get("name", "")
 
-        # Categoria
-        category = offer.get("categoryName", "")
+            return Product(
+                title=self._clean_title(title),
+                link=link,
+                store=self.STORE,
+                price=price,
+                original_price=original_price,
+                image_url=image_url,
+                coupon_code=str(coupon).strip() if coupon else None,
+                extra={
+                    "origin_store": store_name,
+                    "promobit_id": id_,
+                }
+            )
+        except Exception:
+            return None
 
-        # Frete grátis (detecta no título)
-        free_shipping = "frete gr" in title.lower()
+    def _parse_html_card(self, card) -> Optional[Product]:
+        """Parseia um card HTML da Promobit."""
+        try:
+            link_el = card.select_one("a[href*='/oferta/']")
+            if not link_el: return None
+            
+            href = link_el.get("href", "")
+            link = f"{self.BASE_URL}{href}" if href.startswith("/") else href
 
-        return Product(
-            title=self._clean_title(title),
-            link=link,
-            store=self.STORE,
-            price=price,
-            original_price=original_price,
-            discount_pct=discount_pct,
-            category=category,
-            image_url=image_url,
-            coupon_code=coupon,
-            free_shipping=free_shipping,
-            extra={
-                "origin_store": store_name,
-                "origin_domain": store_domain,
-                "offer_id": offer.get("offerId"),
-                "likes": offer.get("offerLikes", 0),
-                "promobit_url": promobit_link,
-            },
-        )
+            title_el = card.select_one("h2, h3, [class*='title']")
+            title = title_el.get_text(strip=True) if title_el else ""
+            if not title: return None
+
+            price_el = card.select_one("[class*='price'], .price")
+            price = self._parse_price(price_el.get_text(strip=True)) if price_el else None
+
+            origin_el = card.select_one("[class*='retailer'], .retailer-name")
+            origin_store = origin_el.get_text(strip=True) if origin_el else ""
+
+            img_el = card.select_one("img")
+            image_url = ""
+            if img_el:
+                image_url = img_el.get("src") or img_el.get("data-src") or ""
+
+            return Product(
+                title=self._clean_title(title),
+                link=link,
+                store=self.STORE,
+                price=price,
+                image_url=image_url,
+                extra={"origin_store": origin_store}
+            )
+        except Exception:
+            return None
 
     def _extract_real_link(self, offer: dict) -> Optional[str]:
-        """
-        Extrai o link real da loja de destino da oferta do Promobit.
-
-        O Promobit pode ter o link real em diferentes campos:
-        - offerLink: link direto da loja
-        - offerUrl: URL da oferta na loja
-        - storeUrl: URL da loja
-        """
-        # Campos que podem conter o link real (em ordem de prioridade)
-        link_fields = [
-            "offerLink",
-            "offerUrl",
-            "offerExternalUrl",
-            "storeUrl",
-            "offerAffiliateUrl",
-        ]
-
-        for field_name in link_fields:
-            url = offer.get(field_name, "")
-            if url and isinstance(url, str) and url.startswith("http"):
-                # Verifica se não é um link do próprio Promobit
-                if "promobit.com.br" not in url:
-                    return self._clean_external_url(url)
-
-        # Tenta construir a partir do domínio da loja
-        store_domain = offer.get("storeDomain", "")
-        offer_external_id = offer.get("offerExternalId", "")
-        if store_domain and offer_external_id:
-            # Alguns produtos têm ID externo que pode ser usado
-            return None  # Não temos como construir a URL completa
-
+        """Extrai o link real da loja de destino."""
+        for field in ["offerLink", "offerUrl", "offerExternalUrl", "storeUrl", "offerAffiliateUrl"]:
+            url = offer.get(field)
+            if url and isinstance(url, str) and url.startswith("http") and "promobit.com.br" not in url:
+                return self._clean_external_url(url)
         return None
 
     def _clean_external_url(self, url: str) -> str:
         """Limpa URL externa removendo parâmetros de tracking."""
         try:
             parsed = urlparse(url)
-
-            tracking_params = {
-                "utm_source", "utm_medium", "utm_campaign", "utm_content",
-                "utm_term", "ref", "tag", "aff_id", "clickid",
-                "source", "campaign",
-            }
-
             if parsed.query:
                 params = parse_qs(parsed.query, keep_blank_values=True)
-                cleaned_params = {
-                    k: v for k, v in params.items()
-                    if k.lower() not in tracking_params
-                    and not k.lower().startswith("utm_")
-                }
+                cleaned_params = {k: v for k, v in params.items() if not k.lower().startswith("utm_") and k.lower() not in ["ref", "tag", "aff_id"]}
                 query = urlencode(cleaned_params, doseq=True)
-                url = urlunparse((
-                    parsed.scheme, parsed.netloc, parsed.path,
-                    parsed.params, query, ""
-                ))
-
+                return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, query, ""))
             return url
-
         except Exception:
             return url

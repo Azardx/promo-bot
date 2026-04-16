@@ -4,8 +4,11 @@ Serviço de filtragem inteligente de promoções.
 Aplica múltiplos critérios de filtragem para garantir que apenas
 promoções relevantes e de qualidade sejam enviadas aos usuários.
 
-NOTA: O filtro é intencionalmente permissivo para não bloquear
-ofertas legítimas. A priorização é feita pelo scorer.
+CORREÇÕES v2.3:
+- Filtro de preço mínimo agressivo (ignora miudezas < R$ 15)
+- Blacklist de keywords expandida
+- Filtro de títulos curtos ou genéricos
+- Detecção de spam e caracteres especiais excessivos
 """
 
 from __future__ import annotations
@@ -25,14 +28,23 @@ SPAM_PATTERNS = [
     r"(?i)produto\s+indispon[ií]vel",
     r"(?i)fora\s+de\s+estoque",
     r"(?i)esgotado",
+    r"(?i)ganhe dinheiro",
+    r"(?i)renda extra",
+    r"(?i)trabalhe em casa",
 ]
 
 # Palavras que indicam produtos genéricos/irrelevantes
-# (lista reduzida — apenas itens realmente irrelevantes)
 LOW_QUALITY_WORDS = [
     "amostra grátis",
     "manual pdf",
     "etiqueta adesiva",
+    "capinha",
+    "película",
+    "adesivo",
+    "chaveiro",
+    "meia",
+    "cueca",
+    "calcinha",
 ]
 
 
@@ -46,10 +58,10 @@ class ProductFilter:
 
     def __init__(
         self,
-        min_price: float = 1.0,
-        max_price: float = 50000.0,
+        min_price: float = settings.min_price,
+        max_price: float = settings.max_price,
         blocked_keywords: Optional[list[str]] = None,
-        min_title_length: int = 10,
+        min_title_length: int = 15,
     ):
         self._min_price = min_price
         self._max_price = max_price
@@ -91,7 +103,7 @@ class ProductFilter:
         Returns:
             None se aprovado, ou string com motivo da rejeição.
         """
-        # 1. Título mínimo
+        # 1. Título mínimo (v2.3: aumentado para 15)
         if len(product.title.strip()) < self._min_title_length:
             return "titulo_curto"
 
@@ -99,7 +111,7 @@ class ProductFilter:
         if not product.link or not product.link.startswith("http"):
             return "link_invalido"
 
-        # 3. Filtro de preço (apenas se preço existir)
+        # 3. Filtro de preço (v2.3: min_price R$ 15)
         if product.price is not None:
             if product.price < self._min_price:
                 return f"preco_baixo ({product.price:.2f})"
@@ -112,7 +124,7 @@ class ProductFilter:
             if keyword.lower() in title_lower:
                 return f"palavra_bloqueada ({keyword})"
 
-        # 5. Palavras de baixa qualidade (apenas combinações específicas)
+        # 5. Palavras de baixa qualidade
         for word in LOW_QUALITY_WORDS:
             if word.lower() in title_lower:
                 return f"baixa_qualidade ({word})"
@@ -124,7 +136,7 @@ class ProductFilter:
 
         # 7. Título com muitos caracteres especiais (spam)
         special_chars = sum(1 for c in product.title if not c.isalnum() and c not in " .,/-()[]!@#$%&*+:;'\"")
-        if len(product.title) > 0 and special_chars > len(product.title) * 0.4:
+        if len(product.title) > 0 and special_chars > len(product.title) * 0.3:
             return "excesso_caracteres_especiais"
 
         # 8. Título duplicado/genérico

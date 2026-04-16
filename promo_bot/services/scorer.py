@@ -1,8 +1,14 @@
 """
-Serviço de scoring e priorização de promoções.
+Serviço de scoring e priorização de promoções profissional.
 
 Calcula uma pontuação para cada oferta com base em múltiplos
-critérios, permitindo enviar primeiro as melhores promoções.
+critérios, priorizando produtos de alto valor e descontos reais.
+
+CORREÇÕES v2.3:
+- Scoring agressivo para eletrônicos e games
+- Filtro de produtos baratos e irrelevantes
+- Bônus para cupons e frete grátis
+- Detecção de spam e títulos ruins
 """
 
 from __future__ import annotations
@@ -16,198 +22,87 @@ from promo_bot.utils.logger import get_logger
 
 logger = get_logger("scorer")
 
-# Categorias de alto valor com pesos
+# Categorias de alto valor com pesos (1-10)
 HIGH_VALUE_CATEGORIES = {
-    # Tecnologia
-    "notebook": 8, "laptop": 8, "macbook": 9,
-    "iphone": 9, "ipad": 8, "galaxy": 7, "pixel": 7,
-    "smartphone": 6, "celular": 5,
-    "ssd": 7, "nvme": 7, "hd externo": 5,
-    "rtx": 9, "rx 7": 8, "gpu": 8, "placa de vídeo": 8, "placa de video": 8,
-    "monitor": 7, "ultrawide": 8,
-    "playstation": 8, "ps5": 9, "xbox": 8, "nintendo switch": 8,
-    "airpods": 7, "headset": 5, "fone bluetooth": 5,
-    "teclado mecânico": 6, "teclado mecanico": 6,
-    "mouse gamer": 5, "cadeira gamer": 6,
-    "processador": 7, "ryzen": 7, "intel core": 7,
-    "memória ram": 6, "memoria ram": 6,
-    "placa mãe": 6, "placa mae": 6,
-    "fonte 80 plus": 5,
-    "roteador": 5, "mesh": 6,
-    "tablet": 6, "kindle": 6,
-    "smart tv": 7, "oled": 8, "4k": 6,
-    "câmera": 6, "camera": 6, "gopro": 7, "drone": 7,
-    # Eletrodomésticos premium
-    "air fryer": 5, "airfryer": 5,
-    "robô aspirador": 7, "robo aspirador": 7,
-    "cafeteira": 4, "nespresso": 5,
-    "aspirador": 4,
+    # Tecnologia & Hardware
+    "notebook": 10, "laptop": 10, "macbook": 10, "rtx": 10, "gpu": 10,
+    "iphone": 10, "galaxy s": 9, "smartphone": 8, "ssd": 8, "nvme": 8,
+    "processador": 9, "ryzen": 9, "intel core": 9, "placa de vídeo": 10,
+    "monitor": 8, "smart tv": 9, "oled": 10, "qled": 9,
+    # Games
+    "playstation": 10, "ps5": 10, "xbox": 10, "nintendo switch": 10,
+    "console": 9, "controle": 7, "headset": 6,
+    # Eletrodomésticos Premium
+    "air fryer": 7, "airfryer": 7, "robô aspirador": 8, "robo aspirador": 8,
+    "máquina de lavar": 8, "geladeira": 8, "ar condicionado": 8,
 }
 
-# Lojas com bônus de confiabilidade
-STORE_BONUS = {
-    "amazon": 2,
-    "kabum": 2,
-    "pelando": 3,  # Já validado pela comunidade
-    "promobit": 3,
-}
-
+# Palavras-chave de spam ou produtos irrelevantes (penalidade)
+LOW_VALUE_KEYWORDS = [
+    "capinha", "película", "adesivo", "cabo usb", "chaveiro", "meia",
+    "cueca", "calcinha", "escova de dente", "sabonete", "shampoo",
+    "detergente", "esponja", "pano de prato", "caneta", "lápis"
+]
 
 class PromoScorer:
-    """
-    Sistema de scoring para priorização de ofertas.
-
-    Calcula uma pontuação de 0 a 100 com base em:
-    - Percentual de desconto
-    - Categoria do produto
-    - Confiabilidade da loja
-    - Palavras-chave prioritárias
-    - Presença de cupom
-    - Frete grátis
-    """
+    """Sistema de scoring profissional para priorização de ofertas."""
 
     def __init__(self, priority_keywords: Optional[list[str]] = None):
         self._priority_keywords = priority_keywords or settings.priority_keywords
 
     def score_and_sort(self, products: list[Product]) -> list[Product]:
-        """
-        Calcula score para cada produto e ordena por prioridade.
-
-        Args:
-            products: Lista de produtos para pontuar.
-
-        Returns:
-            Lista ordenada do maior para o menor score.
-        """
+        """Calcula score e ordena por prioridade."""
+        scored_products = []
         for product in products:
             product.score = self._calculate_score(product)
+            # Filtro de qualidade mínima: ignora produtos com score muito baixo
+            if product.score >= 15:
+                scored_products.append(product)
 
         # Ordena por score decrescente
-        sorted_products = sorted(products, key=lambda p: p.score, reverse=True)
-
-        if sorted_products:
-            logger.info(
-                f"Scoring: top={sorted_products[0].score:.1f} "
-                f"({sorted_products[0].title[:40]}), "
-                f"min={sorted_products[-1].score:.1f}, "
-                f"media={sum(p.score for p in sorted_products) / len(sorted_products):.1f}"
-            )
-
-        return sorted_products
+        return sorted(scored_products, key=lambda p: p.score, reverse=True)
 
     def _calculate_score(self, product: Product) -> float:
-        """Calcula a pontuação total de um produto."""
+        """Calcula a pontuação total de um produto (0-100)."""
         score = 0.0
 
-        # 1. Desconto (0-30 pontos)
-        score += self._score_discount(product)
+        # 1. Valor do Produto (Base: 0-40 pontos)
+        # Prioriza produtos mais caros (eletrônicos vs miudezas)
+        if product.price:
+            if product.price > 2000: score += 40
+            elif product.price > 1000: score += 35
+            elif product.price > 500: score += 25
+            elif product.price > 100: score += 15
+            elif product.price < 10: score -= 20  # Penaliza produtos muito baratos
 
-        # 2. Categoria/produto (0-25 pontos)
-        score += self._score_category(product)
-
-        # 3. Palavras-chave prioritárias (0-15 pontos)
-        score += self._score_keywords(product)
-
-        # 4. Bônus da loja (0-10 pontos)
-        score += self._score_store(product)
-
-        # 5. Extras: cupom, frete grátis (0-10 pontos)
-        score += self._score_extras(product)
-
-        # 6. Qualidade do título (0-10 pontos)
-        score += self._score_title_quality(product)
-
-        # Normaliza para 0-100
-        return min(100.0, max(0.0, score))
-
-    def _score_discount(self, product: Product) -> float:
-        """Pontua baseado no percentual de desconto."""
+        # 2. Desconto Real (0-30 pontos)
         discount = product.calculated_discount
-        if discount is None:
-            return 5.0  # Pontuação neutra se não tem desconto calculável
+        if discount:
+            if discount >= 50: score += 30
+            elif discount >= 30: score += 20
+            elif discount >= 15: score += 10
+            elif discount < 5: score -= 10  # Ignora descontos falsos/baixos
 
-        if discount >= 70:
-            return 30.0
-        elif discount >= 50:
-            return 25.0
-        elif discount >= 40:
-            return 20.0
-        elif discount >= 30:
-            return 15.0
-        elif discount >= 20:
-            return 10.0
-        elif discount >= 10:
-            return 7.0
-        else:
-            return 3.0
-
-    def _score_category(self, product: Product) -> float:
-        """Pontua baseado na categoria do produto."""
+        # 3. Categoria e Keywords (0-20 pontos)
         title_lower = product.title.lower()
-        max_score = 0.0
+        for kw, weight in HIGH_VALUE_CATEGORIES.items():
+            if kw in title_lower:
+                score += weight * 2
+                break
+        
+        for kw in LOW_VALUE_KEYWORDS:
+            if kw in title_lower:
+                score -= 30
+                break
 
-        for keyword, weight in HIGH_VALUE_CATEGORIES.items():
-            if keyword in title_lower:
-                # Normaliza peso (1-9) para escala (3-25)
-                category_score = 3 + (weight / 9) * 22
-                max_score = max(max_score, category_score)
+        # 4. Extras (0-10 pontos)
+        if product.coupon_code: score += 7
+        if product.free_shipping: score += 3
 
-        return max_score
+        # 5. Penalidade por Título Ruim/Spam
+        if len(product.title) < 15 or len(product.title) > 200:
+            score -= 15
+        if "???" in product.title or "!!!" in product.title:
+            score -= 10
 
-    def _score_keywords(self, product: Product) -> float:
-        """Pontua baseado em palavras-chave prioritárias do usuário."""
-        title_lower = product.title.lower()
-        matches = sum(
-            1 for kw in self._priority_keywords
-            if kw.lower() in title_lower
-        )
-
-        if matches >= 3:
-            return 15.0
-        elif matches == 2:
-            return 10.0
-        elif matches == 1:
-            return 5.0
-        return 0.0
-
-    def _score_store(self, product: Product) -> float:
-        """Pontua baseado na confiabilidade da loja."""
-        store_name = product.store.value.lower()
-        bonus = STORE_BONUS.get(store_name, 0)
-        return float(bonus) * 2  # Escala para 0-10
-
-    def _score_extras(self, product: Product) -> float:
-        """Pontua extras como cupom e frete grátis."""
-        score = 0.0
-        if product.coupon_code:
-            score += 5.0
-        if product.free_shipping:
-            score += 3.0
-        if product.image_url:
-            score += 2.0
-        return min(10.0, score)
-
-    def _score_title_quality(self, product: Product) -> float:
-        """Pontua a qualidade do título."""
-        title = product.title
-        score = 0.0
-
-        # Título com comprimento adequado
-        if 30 <= len(title) <= 150:
-            score += 3.0
-        elif 20 <= len(title) <= 200:
-            score += 1.0
-
-        # Tem informações de preço
-        if product.price is not None:
-            score += 3.0
-
-        # Tem desconto calculável
-        if product.calculated_discount is not None:
-            score += 2.0
-
-        # Tem preço original (permite mostrar economia)
-        if product.original_price is not None:
-            score += 2.0
-
-        return min(10.0, score)
+        return min(100.0, max(0.0, score))

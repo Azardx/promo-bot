@@ -4,9 +4,11 @@ Motor de promoções (Promo Engine) do PromoBot.
 Orquestra todo o pipeline de coleta, filtragem, deduplicação,
 scoring e envio de promoções. É o cérebro do sistema.
 
-CORREÇÕES v2.1:
-- Timeout individual por scraper para evitar travamento
-- Coleta concorrente com proteção contra scrapers lentos
+CORREÇÕES v2.3:
+- Limite de 10 ofertas por ciclo (qualidade > quantidade)
+- Delay de 3s entre envios para evitar rate limit
+- Scoring integrado para priorização
+- Tratamento de erros por scraper
 """
 
 from __future__ import annotations
@@ -104,11 +106,11 @@ class PromoEngine:
             logger.info("Todos os produtos eram duplicatas")
             return []
 
-        # 4. Scoring e priorização
+        # 4. Scoring e priorização (Qualidade > Quantidade)
         prioritized = self._scorer.score_and_sort(unique)
 
-        # 5. Limita quantidade por ciclo
-        max_per_cycle = settings.max_promos_per_cycle
+        # 5. Limita quantidade por ciclo (Top 10 para evitar spam)
+        max_per_cycle = min(settings.max_promos_per_cycle, 10)
         final = prioritized[:max_per_cycle]
 
         cycle_duration = round(time.time() - cycle_start, 2)

@@ -3,6 +3,11 @@ Módulo de configuração central do PromoBot.
 
 Carrega todas as variáveis de ambiente do arquivo .env e fornece
 constantes de configuração para todos os módulos do sistema.
+
+CORREÇÕES v2.3:
+- Adição de Terabyte e Mercado Livre aos scrapers padrão
+- Ajuste de limites de preço e keywords
+- Configurações de rate limit e delay (Qualidade > Quantidade)
 """
 
 from __future__ import annotations
@@ -70,29 +75,29 @@ class Settings:
     group_id: str = _get_env("GROUP_ID")       # Grupo alternativo
 
     # --- Scraping -----------------------------------------------------------
-    scrape_interval: int = _get_int("SCRAPE_INTERVAL", 120)         # segundos
-    http_timeout: int = _get_int("HTTP_TIMEOUT", 15)                # segundos
+    scrape_interval: int = _get_int("SCRAPE_INTERVAL", 600)         # 10 min (v2.3)
+    http_timeout: int = _get_int("HTTP_TIMEOUT", 30)                # 30s (v2.3)
     max_retries: int = _get_int("MAX_RETRIES", 3)
-    rate_limit_delay: float = _get_float("RATE_LIMIT_DELAY", 2.0)  # entre reqs
-    max_concurrent_scrapers: int = _get_int("MAX_CONCURRENT_SCRAPERS", 5)
+    rate_limit_delay: float = _get_float("RATE_LIMIT_DELAY", 3.0)  # 3s entre reqs (v2.3)
+    max_concurrent_scrapers: int = _get_int("MAX_CONCURRENT_SCRAPERS", 3)
 
     # --- Proxies (opcional) -------------------------------------------------
     use_proxies: bool = _get_bool("USE_PROXIES", False)
     proxy_list_file: str = _get_env("PROXY_LIST_FILE", "proxies.txt")
 
     # --- Filtros ------------------------------------------------------------
-    min_price: float = _get_float("MIN_PRICE", 10.0)
+    min_price: float = _get_float("MIN_PRICE", 15.0)  # Ignora miudezas (v2.3)
     max_price: float = _get_float("MAX_PRICE", 50000.0)
     blocked_keywords: list[str] = field(
         default_factory=lambda: _get_list(
             "BLOCKED_KEYWORDS",
-            "capinha,película,adesivo,suporte celular,cabo usb,manual,pdf,amostra"
+            "capinha,película,adesivo,suporte celular,cabo usb,manual,pdf,amostra,chaveiro,meia,cueca"
         )
     )
     priority_keywords: list[str] = field(
         default_factory=lambda: _get_list(
             "PRIORITY_KEYWORDS",
-            "ssd,rtx,notebook,iphone,airpods,galaxy,playstation,xbox,monitor,gpu"
+            "ssd,rtx,notebook,iphone,airpods,galaxy,playstation,xbox,monitor,gpu,ryzen,intel core"
         )
     )
 
@@ -100,8 +105,8 @@ class Settings:
     db_path: str = _get_env("DB_PATH", str(_PROJECT_ROOT / "data" / "promo_bot.db"))
 
     # --- Cache --------------------------------------------------------------
-    cache_ttl: int = _get_int("CACHE_TTL", 3600)          # segundos
-    cache_max_size: int = _get_int("CACHE_MAX_SIZE", 5000)
+    cache_ttl: int = _get_int("CACHE_TTL", 86400)          # 24h (v2.3)
+    cache_max_size: int = _get_int("CACHE_MAX_SIZE", 10000)
 
     # --- Monitoramento ------------------------------------------------------
     watchdog_interval: int = _get_int("WATCHDOG_INTERVAL", 300)  # segundos
@@ -116,8 +121,8 @@ class Settings:
     )
 
     # --- Broadcast ----------------------------------------------------------
-    broadcast_delay: float = _get_float("BROADCAST_DELAY", 0.5)  # entre msgs
-    max_promos_per_cycle: int = _get_int("MAX_PROMOS_PER_CYCLE", 30)
+    broadcast_delay: float = _get_float("BROADCAST_DELAY", 3.0)  # 3s entre msgs (v2.3)
+    max_promos_per_cycle: int = _get_int("MAX_PROMOS_PER_CYCLE", 10) # Top 10 (v2.3)
 
     @property
     def target_chat_id(self) -> str:
